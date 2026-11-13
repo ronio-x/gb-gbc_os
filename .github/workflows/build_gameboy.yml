@@ -1,0 +1,603 @@
+Open options
+name: Build ESP32-S3 Dedicated GameBoy Console (Peanut-GB)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python & Install PlatformIO
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip
+          pip3 install --upgrade platformio esptool
+
+      - name: Generate Complete GameBoy Console with Brightness & Temp
+        run: |
+          mkdir -p gb_project/src
+          mkdir -p gb_project/include
+
+          # ১. Peanut-GB কোর ডাউনলোড
+          curl -sSfL "https://raw.githubusercontent.com/deltabeard/Peanut-GB/master/peanut_gb.h" -o gb_project/include/peanut_gb.h
+
+          # ২. ১৬ MB শেয়ার্ড ২-স্লট পার্টিশন টেবিল
+          cat << 'EOF' > gb_project/partitions.csv
+          # Name,   Type, SubType, Offset,   Size,     Flags
+          nvs,      data, nvs,     0x9000,   0x6000,
+          otadata,  data, ota,     0xf000,   0x2000,
+          app0,     app,  ota_0,   0x20000,  0x380000,
+          app1,     app,  ota_1,   0x3a0000, 0x380000,
+          vfs,      data, fat,     0x720000, 0x8e0000,
+          EOF
+
+          # ৩. PlatformIO কনফিগারেশন
+          cat << 'EOF' > gb_project/platformio.ini
+          [env:esp32-s3-gameboy]
+          platform = espressif32
+          board = esp32-s3-devkitc-1
+          framework = arduino
+          board_build.flash_mode = qio
+          board_build.f_flash = 80000000L
+          board_upload.flash_size = 16MB
+          board_build.partitions = partitions.csv
+          board_build.filesystem = littlefs
+          build_flags =
+              -DBOARD_HAS_PSRAM
+              -mfix-esp32-psram-cache-issue
+              -DCONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=0
+              -DCORE_DEBUG_LEVEL=0
+              -DENABLE_SOUND=1
+          lib_deps =
+              lovyan03/LovyanGFX @ ^1.1.16
+          EOF
+
+          # ৪. ফুল C++ সোর্স কোড (উইথ ব্রাইটনেস সেভার ও সিপিইউ টেম্পারেচার HUD)
+          cat << 'EOF' > gb_project/src/main.cpp
+          #define LGFX_USE_V1
+          #include <LovyanGFX.hpp>
+          #include <Arduino.h>
+          #include <WiFi.h>
+          #include <FS.h>
+          #include <LittleFS.h>
+          #include <driver/i2s.h>
+          #include <esp_ota_ops.h>
+          #include <esp_partition.h>
+          #include <vector>
+          #include "peanut_gb.h"
+
+          // --- LovyanGFX ডিসপ্লে কনফিগ (ভেরিফাইড ৩২০x২৪০ ল্যান্ডস্কেপ) ---
+          class LGFX : public lgfx::LGFX_Device {
+              lgfx::Panel_ILI9341 _panel;
+              lgfx::Bus_SPI       _bus;
+              lgfx::Light_PWM     _light;
+          public:
+              LGFX() {
+                  {
+                      auto cfg = _bus.config();
+                      cfg.spi_host = SPI2_HOST;
+                      cfg.spi_mode = 0;
+                      cfg.freq_write = 20000000;
+                      cfg.pin_sclk = 12;
+                      cfg.pin_mosi = 11;
+                      cfg.pin_miso = 13;
+                      cfg.pin_dc   = 8;
+                      _bus.config(cfg);
+                      _panel.setBus(&_bus);
+                  }
+                  {
+                      auto cfg = _panel.config();
+                      cfg.pin_cs   = 10;
+                      cfg.pin_rst  = 9;
+                      cfg.memory_width  = 320;
+                      cfg.memory_height = 240;
+                      cfg.panel_width   = 320;
+                      cfg.panel_height  = 240;
+                      cfg.offset_rotation = 0;
+                      cfg.rgb_order = true;
+                      cfg.invert = false;
+                      _panel.config(cfg);
+                  }
+                  {
+                      auto cfg = _light.config();
+                      cfg.pin_bl = 7;
+                      _light.config(cfg);
+                      _panel.setLight(&_light);
+                  }
+                  setPanel(&_panel);
+              }
+          };
+          LGFX tft;
+          LGFX_Sprite game_sprite(&tft);
+
+          // --- পিনম্যাপ ---
+          #define PIN_JOY_X 1
+          #define PIN_JOY_Y 2
+          #define PIN_B1    5   // A
+          #define PIN_B2    6   // B
+          #define PIN_B3    40  // Start / Menu
+
+          #define I2S_NUM         I2S_NUM_0
+          #define I2S_BCK_IO      42
+          #define I2S_WS_IO       41
+          #define I2S_DO_IO       48
+
+          uint8_t *rom_buffer = NULL;
+          size_t rom_size = 0;
+          struct gb_s gb;
+          String current_rom_path = "";
+          String current_rom_name = "";
+
+          uint16_t palettes[4][4] = {
+              { 0x0000, 0x52AA, 0xAD55, 0xFFFF }, // Pocket B&W
+              { 0x1900, 0x3A60, 0x8C41, 0xCE66 }, // Classic Pea-Soup Green
+              { 0x0000, 0x61E0, 0xC380, 0xFDC0 }, // Cyber Amber
+              { 0x0000, 0x01E8, 0x04F5, 0x07FF }  // Neon Cyan
+          };
+          int active_palette = 0;
+
+          // ব্রাইটনেস ও থার্মাল গ্লোবাল ভ্যারিয়েবল
+          int backlight_pct = 80;
+          int cpu_temp_c = 38;
+
+          std::vector<String> game_files;
+          int home_selected = 0;
+          enum ConsoleState { STATE_HOME, STATE_INGAME, STATE_PAUSED, STATE_CONFIRM_EXIT };
+          ConsoleState app_state = STATE_HOME;
+          int pause_selected = 0;
+          int confirm_selected = 1;
+
+          // --- গ্লোবাল ব্রাইটনেস সেভ ও লোড (/backlight.cfg) ---
+          void load_saved_brightness() {
+              File f = LittleFS.open("/backlight.cfg", "r");
+              if (f) {
+                  String val = f.readStringUntil('\n');
+                  val.trim();
+                  int b = val.toInt();
+                  if (b >= 5 && b <= 100) backlight_pct = b;
+                  f.close();
+              }
+              tft.setBrightness((backlight_pct * 255) / 100);
+          }
+
+          void save_brightness(int val) {
+              backlight_pct = constrain(val, 5, 100);
+              tft.setBrightness((backlight_pct * 255) / 100);
+              File f = LittleFS.open("/backlight.cfg", "w");
+              if (f) {
+                  f.print(backlight_pct);
+                  f.close();
+              }
+          }
+
+          void setup_i2s() {
+              i2s_config_t i2s_config = {
+                  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+                  .sample_rate = 32768,
+                  .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+                  .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+                  .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+                  .intr_alloc_flags = 0,
+                  .dma_buf_count = 4,
+                  .dma_buf_len = 512,
+                  .use_apll = false
+              };
+              i2s_pin_config_t pin_config = {
+                  .bck_io_num = I2S_BCK_IO,
+                  .ws_io_num = I2S_WS_IO,
+                  .data_out_num = I2S_DO_IO,
+                  .data_in_num = I2S_PIN_NO_CHANGE
+              };
+              i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+              i2s_set_pin(I2S_NUM, &pin_config);
+          }
+
+          uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr) {
+              if (addr < rom_size) return rom_buffer[addr];
+              return 0xFF;
+          }
+
+          void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160], const uint_fast8_t line) {
+              static uint16_t scaled_line[266];
+              for (int x = 0; x < 266; x++) {
+                  int src_x = (x * 160) / 266;
+                  scaled_line[x] = palettes[active_palette][pixels[src_x] & 3];
+              }
+
+              int y_start = (line * 240) / 144;
+              int y_end = ((line + 1) * 240) / 144;
+              for (int y = y_start; y < y_end; y++) {
+                  if (y < 240) {
+                      game_sprite.pushImage(0, y, 266, 1, scaled_line);
+                  }
+              }
+
+              if (line == 143) {
+                  game_sprite.pushSprite(27, 0); // X=27 সেন্টারিং উইথ ব্ল্যাক সাইডস
+              }
+          }
+
+          void return_to_master_launcher() {
+              tft.fillScreen(TFT_BLACK);
+              tft.setTextColor(0x07E0);
+              tft.setTextSize(2);
+              tft.drawCenterString("REBOOTING TO LAUNCHER...", 160, 110);
+              delay(500);
+
+              const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+              if (part) {
+                  esp_ota_set_boot_partition(part);
+                  delay(200);
+                  esp_restart();
+              }
+          }
+
+          void scan_games() {
+              game_files.clear();
+              File root = LittleFS.open("/games");
+              if (root && root.isDirectory()) {
+                  File f = root.openNextFile();
+                  while (f) {
+                      String name = f.name();
+                      if (name.endsWith(".gb") || name.endsWith(".gbc")) {
+                          game_files.push_back(name);
+                      }
+                      f = root.openNextFile();
+                  }
+              }
+          }
+
+          void start_game(String filename) {
+              current_rom_name = filename;
+              current_rom_path = "/games/" + filename;
+              if (!current_rom_path.startsWith("/")) current_rom_path = "/" + current_rom_path;
+
+              File f = LittleFS.open(current_rom_path, "r");
+              if (!f) return;
+
+              rom_size = f.size();
+              if (rom_buffer) free(rom_buffer);
+              rom_buffer = (uint8_t *)ps_malloc(rom_size);
+              f.read(rom_buffer, rom_size);
+              f.close();
+
+              gb_init(&gb, &gb_rom_read, NULL, NULL, NULL, NULL);
+              gb_init_lcd(&gb, &lcd_draw_line);
+              
+              WiFi.mode(WIFI_OFF); // গেম চলাকালীন Wi-Fi অফ (হিট প্রিভেনশন)
+
+              tft.fillScreen(TFT_BLACK);
+              app_state = STATE_INGAME;
+          }
+
+          void save_state() {
+              String state_path = "/games/" + current_rom_name + ".state";
+              File sf = LittleFS.open(state_path, "w");
+              if (sf) {
+                  sf.write((uint8_t*)&gb, sizeof(struct gb_s));
+                  sf.close();
+              }
+          }
+
+          void load_state() {
+              String state_path = "/games/" + current_rom_name + ".state";
+              File sf = LittleFS.open(state_path, "r");
+              if (sf) {
+                  sf.read((uint8_t*)&gb, sizeof(struct gb_s));
+                  sf.close();
+              }
+          }
+
+          // --- হোম স্ক্রিন UI (উইথ ব্রাইটনেস বার ও লাইভ CPU Temp) ---
+          void draw_home_ui() {
+              tft.fillScreen(TFT_BLACK);
+
+              // হেডার বার
+              tft.fillRect(0, 0, 320, 24, 0x01E0);
+              tft.setTextColor(0x07E0);
+              tft.setTextSize(2);
+              tft.drawString("GAME BOY COLOR CONSOLE", 10, 4);
+              tft.drawFastHLine(0, 24, 320, 0x07E0);
+
+              int total_games = game_files.size();
+              int bright_idx = total_games;
+              int exit_idx = total_games + 1;
+
+              // ১. গেম তালিকা
+              int y = 32;
+              if (game_files.empty()) {
+                  tft.setTextColor(TFT_WHITE);
+                  tft.setTextSize(1);
+                  tft.drawString("No games found in /games directory!", 15, 45);
+                  y += 35;
+              } else {
+                  tft.setTextSize(2);
+                  for (size_t i = 0; i < game_files.size() && i < 3; i++) {
+                      if ((int)i == home_selected) {
+                          tft.fillRect(6, y - 2, 308, 28, 0x07E0);
+                          tft.setTextColor(TFT_BLACK);
+                      } else {
+                          tft.fillRect(6, y - 2, 308, 28, 0x0120);
+                          tft.setTextColor(TFT_WHITE);
+                      }
+                      tft.drawString(String(i + 1) + ". " + game_files[i], 12, y + 4);
+                      y += 32;
+                  }
+              }
+
+              // ২. ব্রাইটনেস কন্ট্রোল ও লাইভ টেম্পারেচার প্যানেল
+              y = 125;
+              bool is_bright_sel = (home_selected == bright_idx);
+              tft.fillRect(6, y - 2, 308, 48, is_bright_sel ? 0x0280 : 0x0841);
+              tft.drawRect(6, y - 2, 308, 48, is_bright_sel ? 0x07E0 : 0x2104);
+
+              tft.setTextSize(1);
+              tft.setTextColor(is_bright_sel ? 0x07E0 : TFT_WHITE);
+              tft.drawString("Brightness Control [< >]: " + String(backlight_pct) + "%", 14, y + 2);
+
+              // ব্রাইটনেস প্রগ্রেস বার
+              tft.drawRect(14, y + 14, 200, 10, TFT_WHITE);
+              tft.fillRect(16, y + 16, (backlight_pct * 196) / 100, 6, 0x07E0);
+
+              // ব্রাইটনেস বারের ঠিক নিচে লাইভ CPU Temperature!
+              cpu_temp_c = (int)temperatureRead();
+              tft.setTextColor(TFT_YELLOW);
+              tft.drawString("CPU Temp: " + String(cpu_temp_c) + " C", 14, y + 28);
+              tft.setTextColor(TFT_CYAN);
+              tft.drawRightString("Storage: /vfs", 300, y + 28);
+
+              // ৩. এক্সিট টু লঞ্চার বাটন
+              y = 178;
+              if (home_selected == exit_idx) {
+                  tft.fillRect(6, y, 308, 28, 0xE000);
+                  tft.setTextColor(TFT_WHITE);
+              } else {
+                  tft.fillRect(6, y, 308, 28, 0x3000);
+                  tft.setTextColor(TFT_LIGHTGRAY);
+              }
+              tft.setTextSize(1);
+              tft.drawString("-> RETURN TO MULTI-BOOT LAUNCHER", 14, y + 8);
+
+              // ফুটার
+              tft.drawFastHLine(0, 216, 320, 0x07E0);
+              tft.setTextColor(0x07E0);
+              tft.drawString("Joy: Move | B1: Action | Joy < >: Brightness", 10, 222);
+          }
+
+          void draw_confirm_dialog() {
+              tft.fillRect(40, 50, 240, 130, 0x0841);
+              tft.drawRect(40, 50, 240, 130, TFT_WHITE);
+              tft.setTextColor(TFT_WHITE);
+              tft.setTextSize(2);
+              tft.drawCenterString("CONFIRM REBOOT", 160, 65);
+              tft.setTextSize(1);
+              tft.drawCenterString("Return to Multi-Boot Launcher?", 160, 95);
+
+              if (confirm_selected == 0) {
+                  tft.fillRect(60, 125, 80, 30, 0x07E0);
+                  tft.setTextColor(TFT_BLACK);
+              } else {
+                  tft.fillRect(60, 125, 80, 30, 0x18E3);
+                  tft.setTextColor(TFT_WHITE);
+              }
+              tft.setTextSize(2);
+              tft.drawCenterString("YES", 100, 132);
+
+              if (confirm_selected == 1) {
+                  tft.fillRect(180, 125, 80, 30, 0xE000);
+                  tft.setTextColor(TFT_WHITE);
+              } else {
+                  tft.fillRect(180, 125, 80, 30, 0x18E3);
+                  tft.setTextColor(TFT_WHITE);
+              }
+              tft.drawCenterString("NO", 220, 132);
+          }
+
+          void draw_pause_menu() {
+              tft.fillRect(45, 25, 230, 190, 0x0841);
+              tft.drawRect(45, 25, 230, 190, 0x07E0);
+              tft.setTextColor(0x07E0);
+              tft.setTextSize(2);
+              tft.drawCenterString("PAUSED", 160, 35);
+
+              const char* p_opts[] = {
+                  "1. Resume Game",
+                  "2. Save Status",
+                  "3. Load Status",
+                  "4. Palette Toggle",
+                  "5. Exit to Home"
+              };
+
+              int y = 65;
+              for (int i = 0; i < 5; i++) {
+                  if (i == pause_selected) {
+                      tft.fillRect(55, y - 2, 210, 24, 0x07E0);
+                      tft.setTextColor(TFT_BLACK);
+                  } else {
+                      tft.setTextColor(TFT_WHITE);
+                  }
+                  tft.setTextSize(1);
+                  tft.drawString(p_opts[i], 65, y + 5);
+                  y += 28;
+              }
+          }
+
+          void setup() {
+              tft.init();
+              tft.setRotation(6);
+              tft.invertDisplay(false);
+              tft.fillScreen(TFT_BLACK);
+
+              game_sprite.setColorDepth(16);
+              game_sprite.createSprite(266, 240);
+
+              pinMode(PIN_B1, INPUT_PULLUP);
+              pinMode(PIN_B2, INPUT_PULLUP);
+              pinMode(PIN_B3, INPUT_PULLUP);
+
+              // LittleFS মাউন্ট
+              LittleFS.begin(false, "/vfs", 10, "vfs");
+
+              // গ্লোবাল ব্রাইটনেস লোড
+              load_saved_brightness();
+
+              setup_i2s();
+              scan_games();
+              draw_home_ui();
+          }
+
+          void loop() {
+              int joy_x = analogRead(PIN_JOY_X);
+              int joy_y = analogRead(PIN_JOY_Y);
+              static unsigned long last_input = 0;
+
+              // ১. হোম স্ক্রিন
+              if (app_state == STATE_HOME) {
+                  int total_games = game_files.size();
+                  int bright_idx = total_games;
+                  int exit_idx = total_games + 1;
+                  int total_options = total_games + 2;
+
+                  if (millis() - last_input > 220) {
+                      if (joy_x < 1000 && home_selected > 0) {
+                          home_selected--;
+                          draw_home_ui();
+                          last_input = millis();
+                      } else if (joy_x > 3000 && home_selected < total_options - 1) {
+                          home_selected++;
+                          draw_home_ui();
+                          last_input = millis();
+                      }
+
+                      // ব্রাইটনেস সিলেক্ট করা থাকলে জয়স্টিক ডানে/বামে ব্রাইটনেস চেঞ্জ
+                      if (home_selected == bright_idx) {
+                          if (joy_y > 3000 && backlight_pct < 100) {
+                              save_brightness(backlight_pct + 10);
+                              draw_home_ui();
+                              last_input = millis();
+                          } else if (joy_y < 1000 && backlight_pct > 10) {
+                              save_brightness(backlight_pct - 10);
+                              draw_home_ui();
+                              last_input = millis();
+                          }
+                      }
+                  }
+
+                  if (digitalRead(PIN_B1) == LOW && millis() - last_input > 250) {
+                      last_input = millis();
+                      if (home_selected < total_games) {
+                          start_game(game_files[home_selected]);
+                      } else if (home_selected == exit_idx) {
+                          app_state = STATE_CONFIRM_EXIT;
+                          confirm_selected = 1;
+                          draw_confirm_dialog();
+                      }
+                  }
+                  delay(20);
+              }
+
+              // ২. কনফার্মেশন ডায়ালগ
+              else if (app_state == STATE_CONFIRM_EXIT) {
+                  if (millis() - last_input > 220) {
+                      if (joy_y < 1000) { confirm_selected = 0; draw_confirm_dialog(); last_input = millis(); }
+                      if (joy_y > 3000) { confirm_selected = 1; draw_confirm_dialog(); last_input = millis(); }
+                  }
+
+                  if (digitalRead(PIN_B1) == LOW && millis() - last_input > 250) {
+                      last_input = millis();
+                      if (confirm_selected == 0) {
+                          return_to_master_launcher();
+                      } else {
+                          app_state = STATE_HOME;
+                          draw_home_ui();
+                      }
+                  }
+                  if (digitalRead(PIN_B2) == LOW && millis() - last_input > 250) {
+                      last_input = millis();
+                      app_state = STATE_HOME;
+                      draw_home_ui();
+                  }
+                  delay(20);
+              }
+
+              // ৩. পজ মেনু
+              else if (app_state == STATE_PAUSED) {
+                  if (millis() - last_input > 220) {
+                      if (joy_x < 1000 && pause_selected > 0) { pause_selected--; draw_pause_menu(); last_input = millis(); }
+                      if (joy_x > 3000 && pause_selected < 4) { pause_selected++; draw_pause_menu(); last_input = millis(); }
+                  }
+
+                  if (digitalRead(PIN_B1) == LOW && millis() - last_input > 250) {
+                      last_input = millis();
+                      if (pause_selected == 0) { app_state = STATE_INGAME; tft.fillScreen(TFT_BLACK); }
+                      else if (pause_selected == 1) { save_state(); app_state = STATE_INGAME; tft.fillScreen(TFT_BLACK); }
+                      else if (pause_selected == 2) { load_state(); app_state = STATE_INGAME; tft.fillScreen(TFT_BLACK); }
+                      else if (pause_selected == 3) { active_palette = (active_palette + 1) % 4; draw_pause_menu(); }
+                      else if (pause_selected == 4) { app_state = STATE_HOME; draw_home_ui(); }
+                  }
+                  delay(20);
+              }
+
+              // ৪. গেমপ্লে লুপ
+              else if (app_state == STATE_INGAME) {
+                  uint32_t frame_start = micros();
+
+                  gb.direct.joyp_bits.right = (joy_y > 3000) ? 0 : 1;
+                  gb.direct.joyp_bits.left  = (joy_y < 1000) ? 0 : 1;
+                  gb.direct.joyp_bits.up    = (joy_x < 1000) ? 0 : 1;
+                  gb.direct.joyp_bits.down  = (joy_x > 3000) ? 0 : 1;
+
+                  gb.direct.joyp_bits.a      = digitalRead(PIN_B1);
+                  gb.direct.joyp_bits.b      = digitalRead(PIN_B2);
+                  
+                  if (digitalRead(PIN_B1) == LOW && digitalRead(PIN_B2) == LOW) {
+                      gb.direct.joyp_bits.select = 0;
+                  } else {
+                      gb.direct.joyp_bits.select = 1;
+                  }
+
+                  static unsigned long b3_hold = 0;
+                  if (digitalRead(PIN_B3) == LOW) {
+                      if (b3_hold == 0) b3_hold = millis();
+                      if (millis() - b3_hold > 1500) {
+                          app_state = STATE_PAUSED;
+                          pause_selected = 0;
+                          draw_pause_menu();
+                          b3_hold = 0;
+                          delay(200);
+                          return;
+                      }
+                  } else {
+                      if (b3_hold > 0 && millis() - b3_hold < 1000) {
+                          gb.direct.joyp_bits.start = 0;
+                      } else {
+                          gb.direct.joyp_bits.start = 1;
+                      }
+                      b3_hold = 0;
+                  }
+
+                  gb_run_frame(&gb);
+
+                  // স্লিপ টাইমার (প্রসেসর ঠান্ডা রাখা)
+                  int32_t remaining = 16742 - (int32_t)(micros() - frame_start);
+                  if (remaining > 500) {
+                      delayMicroseconds(remaining);
+                  }
+              }
+          }
+          EOF
+
+      - name: Build GameBoy Binary (.bin)
+        run: |
+          cd gb_project
+          pio run
+
+      - name: Upload GameBoy Firmware (.bin)
+        uses: actions/upload-artifact@v4
+        with:
+          name: peanut_gb
+          path: gb_project/.pio/build/esp32-s3-gameboy/firmware.bin

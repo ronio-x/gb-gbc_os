@@ -16,7 +16,7 @@ jobs:
           sudo apt-get install -y python3 python3-pip
           pip3 install --upgrade platformio esptool
 
-      - name: Generate Complete GameBoy Console with Brightness & Temp
+      - name: Generate Complete GameBoy Console Project
         run: |
           mkdir -p gb_project/src
           mkdir -p gb_project/include
@@ -34,7 +34,7 @@ jobs:
           vfs,      data, fat,     0x720000, 0x8e0000,
           EOF
 
-          # ৩. PlatformIO কনফিগারেশন
+          # ৩. PlatformIO কনফিগারেশন (ক্লিন ও কনফ্লিক্ট-মুক্ত ফ্ল্যাগস)
           cat << 'EOF' > gb_project/platformio.ini
           [env:esp32-s3-gameboy]
           platform = espressif32
@@ -48,14 +48,13 @@ jobs:
           build_flags =
               -DBOARD_HAS_PSRAM
               -mfix-esp32-psram-cache-issue
-              -DCONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=0
               -DCORE_DEBUG_LEVEL=0
-              -DENABLE_SOUND=1
+              -DPEANUT_GB_USE_LCD=1
           lib_deps =
               lovyan03/LovyanGFX @ ^1.1.16
           EOF
 
-          # ৪. ফুল C++ সোর্স কোড (উইথ ব্রাইটনেস সেভার ও সিপিইউ টেম্পারেচার HUD)
+          # ৪. ফুল C++ সোর্স কোড (নিখুঁত সিনট্যাক্স ও থার্মাল কন্ট্রোল)
           cat << 'EOF' > gb_project/src/main.cpp
           #define LGFX_USE_V1
           #include <LovyanGFX.hpp>
@@ -63,7 +62,6 @@ jobs:
           #include <WiFi.h>
           #include <FS.h>
           #include <LittleFS.h>
-          #include <driver/i2s.h>
           #include <esp_ota_ops.h>
           #include <esp_partition.h>
           #include <vector>
@@ -120,11 +118,6 @@ jobs:
           #define PIN_B2    6   // B
           #define PIN_B3    40  // Start / Menu
 
-          #define I2S_NUM         I2S_NUM_0
-          #define I2S_BCK_IO      42
-          #define I2S_WS_IO       41
-          #define I2S_DO_IO       48
-
           uint8_t *rom_buffer = NULL;
           size_t rom_size = 0;
           struct gb_s gb;
@@ -139,7 +132,6 @@ jobs:
           };
           int active_palette = 0;
 
-          // ব্রাইটনেস ও থার্মাল গ্লোবাল ভ্যারিয়েবল
           int backlight_pct = 80;
           int cpu_temp_c = 38;
 
@@ -150,7 +142,7 @@ jobs:
           int pause_selected = 0;
           int confirm_selected = 1;
 
-          // --- গ্লোবাল ব্রাইটনেস সেভ ও লোড (/backlight.cfg) ---
+          // ব্রাইটনেস সেভ ও লোড
           void load_saved_brightness() {
               File f = LittleFS.open("/backlight.cfg", "r");
               if (f) {
@@ -173,33 +165,13 @@ jobs:
               }
           }
 
-          void setup_i2s() {
-              i2s_config_t i2s_config = {
-                  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-                  .sample_rate = 32768,
-                  .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-                  .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-                  .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-                  .intr_alloc_flags = 0,
-                  .dma_buf_count = 4,
-                  .dma_buf_len = 512,
-                  .use_apll = false
-              };
-              i2s_pin_config_t pin_config = {
-                  .bck_io_num = I2S_BCK_IO,
-                  .ws_io_num = I2S_WS_IO,
-                  .data_out_num = I2S_DO_IO,
-                  .data_in_num = I2S_PIN_NO_CHANGE
-              };
-              i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
-              i2s_set_pin(I2S_NUM, &pin_config);
-          }
-
+          // Peanut-GB রম রিড
           uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr) {
               if (addr < rom_size) return rom_buffer[addr];
               return 0xFF;
           }
 
+          // স্ক্রিন ড্রয়িং (২৬৬x২৪০ সেন্টারিং)
           void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160], const uint_fast8_t line) {
               static uint16_t scaled_line[266];
               for (int x = 0; x < 266; x++) {
@@ -267,7 +239,7 @@ jobs:
               gb_init(&gb, &gb_rom_read, NULL, NULL, NULL, NULL);
               gb_init_lcd(&gb, &lcd_draw_line);
               
-              WiFi.mode(WIFI_OFF); // গেম চলাকালীন Wi-Fi অফ (হিট প্রিভেনশন)
+              WiFi.mode(WIFI_OFF);
 
               tft.fillScreen(TFT_BLACK);
               app_state = STATE_INGAME;
@@ -291,11 +263,9 @@ jobs:
               }
           }
 
-          // --- হোম স্ক্রিন UI (উইথ ব্রাইটনেস বার ও লাইভ CPU Temp) ---
           void draw_home_ui() {
               tft.fillScreen(TFT_BLACK);
 
-              // হেডার বার
               tft.fillRect(0, 0, 320, 24, 0x01E0);
               tft.setTextColor(0x07E0);
               tft.setTextSize(2);
@@ -306,7 +276,6 @@ jobs:
               int bright_idx = total_games;
               int exit_idx = total_games + 1;
 
-              // ১. গেম তালিকা
               int y = 32;
               if (game_files.empty()) {
                   tft.setTextColor(TFT_WHITE);
@@ -328,7 +297,6 @@ jobs:
                   }
               }
 
-              // ২. ব্রাইটনেস কন্ট্রোল ও লাইভ টেম্পারেচার প্যানেল
               y = 125;
               bool is_bright_sel = (home_selected == bright_idx);
               tft.fillRect(6, y - 2, 308, 48, is_bright_sel ? 0x0280 : 0x0841);
@@ -338,18 +306,15 @@ jobs:
               tft.setTextColor(is_bright_sel ? 0x07E0 : TFT_WHITE);
               tft.drawString("Brightness Control [< >]: " + String(backlight_pct) + "%", 14, y + 2);
 
-              // ব্রাইটনেস প্রগ্রেস বার
               tft.drawRect(14, y + 14, 200, 10, TFT_WHITE);
               tft.fillRect(16, y + 16, (backlight_pct * 196) / 100, 6, 0x07E0);
 
-              // ব্রাইটনেস বারের ঠিক নিচে লাইভ CPU Temperature!
               cpu_temp_c = (int)temperatureRead();
               tft.setTextColor(TFT_YELLOW);
               tft.drawString("CPU Temp: " + String(cpu_temp_c) + " C", 14, y + 28);
               tft.setTextColor(TFT_CYAN);
               tft.drawRightString("Storage: /vfs", 300, y + 28);
 
-              // ৩. এক্সিট টু লঞ্চার বাটন
               y = 178;
               if (home_selected == exit_idx) {
                   tft.fillRect(6, y, 308, 28, 0xE000);
@@ -361,7 +326,6 @@ jobs:
               tft.setTextSize(1);
               tft.drawString("-> RETURN TO MULTI-BOOT LAUNCHER", 14, y + 8);
 
-              // ফুটার
               tft.drawFastHLine(0, 216, 320, 0x07E0);
               tft.setTextColor(0x07E0);
               tft.drawString("Joy: Move | B1: Action | Joy < >: Brightness", 10, 222);
@@ -438,13 +402,9 @@ jobs:
               pinMode(PIN_B2, INPUT_PULLUP);
               pinMode(PIN_B3, INPUT_PULLUP);
 
-              // LittleFS মাউন্ট
               LittleFS.begin(false, "/vfs", 10, "vfs");
-
-              // গ্লোবাল ব্রাইটনেস লোড
               load_saved_brightness();
 
-              setup_i2s();
               scan_games();
               draw_home_ui();
           }
@@ -472,7 +432,6 @@ jobs:
                           last_input = millis();
                       }
 
-                      // ব্রাইটনেস সিলেক্ট করা থাকলে জয়স্টিক ডানে/বামে ব্রাইটনেস চেঞ্জ
                       if (home_selected == bright_idx) {
                           if (joy_y > 3000 && backlight_pct < 100) {
                               save_brightness(backlight_pct + 10);
@@ -581,7 +540,7 @@ jobs:
 
                   gb_run_frame(&gb);
 
-                  // স্লিপ টাইমার (প্রসেসর ঠান্ডা রাখা)
+                  // থার্মাল কুলিং স্লিপ
                   int32_t remaining = 16742 - (int32_t)(micros() - frame_start);
                   if (remaining > 500) {
                       delayMicroseconds(remaining);

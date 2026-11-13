@@ -34,7 +34,7 @@ jobs:
           vfs,      data, fat,     0x720000, 0x8e0000,
           EOF
 
-          # ৩. PlatformIO কনফিগারেশন
+          # ৩. PlatformIO কনফিগারেশন (N16R8 এর আসল Octal PSRAM এনাবল করা হলো!)
           cat << 'EOF' > gb_project/platformio.ini
           [env:esp32-s3-gameboy]
           platform = espressif32
@@ -43,6 +43,7 @@ jobs:
           board_build.flash_mode = qio
           board_build.f_flash = 80000000L
           board_upload.flash_size = 16MB
+          board_build.arduino.memory_type = qio_opi
           board_build.partitions = partitions.csv
           board_build.filesystem = littlefs
           build_flags =
@@ -55,7 +56,7 @@ jobs:
               lovyan03/LovyanGFX @ ^1.1.16
           EOF
 
-          # ৪. ফুল C++ সোর্স কোড (joypad_bits ফিক্সড + ব্রাইটনেস + CPU Temp)
+          # ৪. ফুল C++ সোর্স কোড (Octal PSRAM ও সেফ লোডিং ফিক্সড)
           cat << 'EOF' > gb_project/src/main.cpp
           #define LGFX_USE_V1
           #define ENABLE_LCD 1
@@ -63,7 +64,6 @@ jobs:
 
           #include <LovyanGFX.hpp>
           #include <Arduino.h>
-          #include <WiFi.h>
           #include <FS.h>
           #include <LittleFS.h>
           #include <esp_ota_ops.h>
@@ -115,7 +115,6 @@ jobs:
           LGFX tft;
           LGFX_Sprite game_sprite(&tft);
 
-          // --- পিনম্যাপ ---
           #define PIN_JOY_X 1
           #define PIN_JOY_Y 2
           #define PIN_B1    5   // A
@@ -148,7 +147,6 @@ jobs:
           int pause_selected = 0;
           int confirm_selected = 1;
 
-          // গ্লোবাল ব্রাইটনেস সেভ ও লোড (/backlight.cfg)
           void load_saved_brightness() {
               File f = LittleFS.open("/backlight.cfg", "r");
               if (f) {
@@ -171,7 +169,6 @@ jobs:
               }
           }
 
-          // Peanut-GB কলব্যাকসমূহ
           uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr) {
               if (addr < rom_size) return rom_buffer[addr];
               return 0xFF;
@@ -190,7 +187,6 @@ jobs:
               // নিরাপদ এরর হ্যান্ডলার
           }
 
-          // স্ক্রিন ড্রয়িং (২৬৬x২৪০ সেন্টারিং উইথ পিচ ব্ল্যাক সাইডস)
           void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160], const uint_fast8_t line) {
               static uint16_t scaled_line[266];
               for (int x = 0; x < 266; x++) {
@@ -244,6 +240,8 @@ jobs:
                   File f = root.openNextFile();
                   while (f) {
                       String name = f.name();
+                      int slash = name.lastIndexOf('/');
+                      if (slash >= 0) name = name.substring(slash + 1);
                       if (name.endsWith(".gb") || name.endsWith(".gbc")) {
                           game_files.push_back(name);
                       }
@@ -252,43 +250,85 @@ jobs:
               }
           }
 
+          void show_load_error(String msg) {
+              tft.fillScreen(TFT_BLACK);
+              tft.setTextColor(TFT_RED);
+              tft.setTextSize(2);
+              tft.drawCenterString("LOAD ERROR!", 160, 80);
+              tft.setTextColor(TFT_WHITE);
+              tft.setTextSize(1);
+              tft.drawCenterString(msg, 160, 120);
+              delay(3000);
+          }
+
           void start_game(String filename) {
+              tft.fillScreen(TFT_BLACK);
+              tft.setTextColor(0x07E0);
+              tft.setTextSize(2);
+              tft.drawCenterString("LOADING ROM...", 160, 100);
+
               current_rom_name = filename;
               current_rom_path = "/games/" + filename;
-              if (!current_rom_path.startsWith("/")) current_rom_path = "/" + current_rom_path;
 
               File f = LittleFS.open(current_rom_path, "r");
-              if (!f) return;
+              if (!f) {
+                  show_load_error("Cannot open: " + current_rom_path);
+                  return;
+              }
 
               rom_size = f.size();
-              if (rom_buffer) free(rom_buffer);
-              rom_buffer = (uint8_t *)ps_malloc(rom_size);
-              f.read(rom_buffer, rom_size);
+              if (rom_size < 1024) {
+                  f.close();
+                  show_load_error("ROM file too small / empty!");
+                  return;
+              }
+
+              if (rom_buffer) { free(rom_buffer); rom_buffer = NULL; }
+              if (psramFound()) {
+                  rom_buffer = (uint8_t *)ps_malloc(rom_size);
+              } else {
+                  rom_buffer = (uint8_t *)malloc(rom_size);
+              }
+
+              if (!rom_buffer) {
+                  f.close();
+                  show_load_error("Memory Alloc Fail! Size: " + String(rom_size));
+                  return;
+              }
+
+              size_t bytes_read = f.read(rom_buffer, rom_size);
               f.close();
 
-              enum gb_init_error_e ret = gb_init(&gb, &gb_rom_read, &gb_cart_ram_read, &gb_cart_ram_write, &gb_error, NULL);
-              if (ret != GB_INIT_NO_ERROR) return;
+              if (bytes_read != rom_size) {
+                  show_load_error("ROM Read Incomplete!");
+                  return;
+              }
 
-              // কার্ট্রিজ র‍্যাম (Save Data) লোড করা
+              enum gb_init_error_e ret = gb_init(&gb, &gb_rom_read, &gb_cart_ram_read, &gb_cart_ram_write, &gb_error, NULL);
+              if (ret != GB_INIT_NO_ERROR) {
+                  show_load_error("Peanut-GB Init Error: " + String((int)ret));
+                  return;
+              }
+
               cart_ram_size = gb_get_save_size(&gb);
               if (cart_ram) { free(cart_ram); cart_ram = NULL; }
               if (cart_ram_size > 0) {
-                  cart_ram = (uint8_t *)ps_malloc(cart_ram_size);
-                  memset(cart_ram, 0, cart_ram_size);
-                  String sav_path = "/games/" + current_rom_name + ".sav";
-                  File sf = LittleFS.open(sav_path, "r");
-                  if (sf) {
-                      sf.read(cart_ram, cart_ram_size);
-                      sf.close();
+                  cart_ram = psramFound() ? (uint8_t *)ps_malloc(cart_ram_size) : (uint8_t *)malloc(cart_ram_size);
+                  if (cart_ram) {
+                      memset(cart_ram, 0, cart_ram_size);
+                      String sav_path = "/games/" + current_rom_name + ".sav";
+                      File sf = LittleFS.open(sav_path, "r");
+                      if (sf) {
+                          sf.read(cart_ram, cart_ram_size);
+                          sf.close();
+                      }
                   }
               }
 
               gb_init_lcd(&gb, &lcd_draw_line);
-              
-              WiFi.mode(WIFI_OFF); // থার্মাল কুলিং
-
               tft.fillScreen(TFT_BLACK);
               app_state = STATE_INGAME;
+              delay(200); // বাটন রিলিজ সেফটি
           }
 
           void save_state() {
@@ -328,7 +368,6 @@ jobs:
                   tft.setTextColor(TFT_WHITE);
                   tft.setTextSize(1);
                   tft.drawString("No games found in /games directory!", 15, 45);
-                  y += 35;
               } else {
                   tft.setTextSize(2);
                   for (size_t i = 0; i < game_files.size() && i < 3; i++) {
@@ -344,7 +383,6 @@ jobs:
                   }
               }
 
-              // ব্রাইটনেস কন্ট্রোল ও লাইভ টেম্পারেচার প্যানেল
               y = 125;
               bool is_bright_sel = (home_selected == bright_idx);
               tft.fillRect(6, y - 2, 308, 48, is_bright_sel ? 0x0280 : 0x0841);
@@ -360,8 +398,8 @@ jobs:
               cpu_temp_c = (int)temperatureRead();
               tft.setTextColor(TFT_YELLOW);
               tft.drawString("CPU Temp: " + String(cpu_temp_c) + " C", 14, y + 28);
-              tft.setTextColor(TFT_CYAN);
-              tft.drawRightString("Storage: /vfs", 300, y + 28);
+              tft.setTextColor(psramFound() ? TFT_GREEN : TFT_RED);
+              tft.drawRightString(psramFound() ? "PSRAM: 8MB" : "PSRAM: FAIL", 300, y + 28);
 
               y = 178;
               if (home_selected == exit_idx) {
@@ -443,6 +481,7 @@ jobs:
               tft.invertDisplay(false);
               tft.fillScreen(TFT_BLACK);
 
+              game_sprite.setPsram(true);
               game_sprite.setColorDepth(16);
               game_sprite.createSprite(266, 240);
 
@@ -462,7 +501,6 @@ jobs:
               int joy_y = analogRead(PIN_JOY_Y);
               static unsigned long last_input = 0;
 
-              // ১. হোম স্ক্রিন
               if (app_state == STATE_HOME) {
                   int total_games = game_files.size();
                   int bright_idx = total_games;
@@ -497,6 +535,7 @@ jobs:
                       last_input = millis();
                       if (home_selected < total_games) {
                           start_game(game_files[home_selected]);
+                          if (app_state != STATE_INGAME) draw_home_ui();
                       } else if (home_selected == exit_idx) {
                           app_state = STATE_CONFIRM_EXIT;
                           confirm_selected = 1;
@@ -505,8 +544,6 @@ jobs:
                   }
                   delay(20);
               }
-
-              // ২. কনফার্মেশন ডায়ালগ
               else if (app_state == STATE_CONFIRM_EXIT) {
                   if (millis() - last_input > 220) {
                       if (joy_y < 1000) { confirm_selected = 0; draw_confirm_dialog(); last_input = millis(); }
@@ -529,8 +566,6 @@ jobs:
                   }
                   delay(20);
               }
-
-              // ৩. পজ মেনু
               else if (app_state == STATE_PAUSED) {
                   if (millis() - last_input > 220) {
                       if (joy_x < 1000 && pause_selected > 0) { pause_selected--; draw_pause_menu(); last_input = millis(); }
@@ -547,14 +582,10 @@ jobs:
                   }
                   delay(20);
               }
-
-              // ৪. গেমপ্লে লুপ (Peanut-GB ৬০ FPS)
               else if (app_state == STATE_INGAME) {
                   uint32_t frame_start = micros();
 
-                  // সব বাটন রিসেট (১ = ছাড়া)
                   gb.direct.joypad = 0xFF;
-
                   gb.direct.joypad_bits.right = (joy_y > 3000) ? 0 : 1;
                   gb.direct.joypad_bits.left  = (joy_y < 1000) ? 0 : 1;
                   gb.direct.joypad_bits.up    = (joy_x < 1000) ? 0 : 1;

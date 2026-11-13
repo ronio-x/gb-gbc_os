@@ -34,7 +34,7 @@ jobs:
           vfs,      data, fat,     0x720000, 0x8e0000,
           EOF
 
-          # ৩. PlatformIO কনফিগারেশন (ক্লিন ও কনফ্লিক্ট-মুক্ত ফ্ল্যাগস)
+          # ৩. PlatformIO কনফিগারেশন
           cat << 'EOF' > gb_project/platformio.ini
           [env:esp32-s3-gameboy]
           platform = espressif32
@@ -49,14 +49,18 @@ jobs:
               -DBOARD_HAS_PSRAM
               -mfix-esp32-psram-cache-issue
               -DCORE_DEBUG_LEVEL=0
-              -DPEANUT_GB_USE_LCD=1
+              -DENABLE_LCD=1
+              -DENABLE_SOUND=0
           lib_deps =
               lovyan03/LovyanGFX @ ^1.1.16
           EOF
 
-          # ৪. ফুল C++ সোর্স কোড (নিখুঁত সিনট্যাক্স ও থার্মাল কন্ট্রোল)
+          # ৪. ফুল C++ সোর্স কোড (joypad_bits ফিক্সড + ব্রাইটনেস + CPU Temp)
           cat << 'EOF' > gb_project/src/main.cpp
           #define LGFX_USE_V1
+          #define ENABLE_LCD 1
+          #define ENABLE_SOUND 0
+
           #include <LovyanGFX.hpp>
           #include <Arduino.h>
           #include <WiFi.h>
@@ -120,6 +124,8 @@ jobs:
 
           uint8_t *rom_buffer = NULL;
           size_t rom_size = 0;
+          uint8_t *cart_ram = NULL;
+          size_t cart_ram_size = 0;
           struct gb_s gb;
           String current_rom_path = "";
           String current_rom_name = "";
@@ -142,7 +148,7 @@ jobs:
           int pause_selected = 0;
           int confirm_selected = 1;
 
-          // ব্রাইটনেস সেভ ও লোড
+          // গ্লোবাল ব্রাইটনেস সেভ ও লোড (/backlight.cfg)
           void load_saved_brightness() {
               File f = LittleFS.open("/backlight.cfg", "r");
               if (f) {
@@ -165,13 +171,26 @@ jobs:
               }
           }
 
-          // Peanut-GB রম রিড
+          // Peanut-GB কলব্যাকসমূহ
           uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr) {
               if (addr < rom_size) return rom_buffer[addr];
               return 0xFF;
           }
 
-          // স্ক্রিন ড্রয়িং (২৬৬x২৪০ সেন্টারিং)
+          uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr) {
+              if (cart_ram && addr < cart_ram_size) return cart_ram[addr];
+              return 0xFF;
+          }
+
+          void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr, const uint8_t val) {
+              if (cart_ram && addr < cart_ram_size) cart_ram[addr] = val;
+          }
+
+          void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t val) {
+              // নিরাপদ এরর হ্যান্ডলার
+          }
+
+          // স্ক্রিন ড্রয়িং (২৬৬x২৪০ সেন্টারিং উইথ পিচ ব্ল্যাক সাইডস)
           void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160], const uint_fast8_t line) {
               static uint16_t scaled_line[266];
               for (int x = 0; x < 266; x++) {
@@ -188,7 +207,18 @@ jobs:
               }
 
               if (line == 143) {
-                  game_sprite.pushSprite(27, 0); // X=27 সেন্টারিং উইথ ব্ল্যাক সাইডস
+                  game_sprite.pushSprite(27, 0);
+              }
+          }
+
+          void save_battery_ram() {
+              if (cart_ram && cart_ram_size > 0 && current_rom_name != "") {
+                  String sav_path = "/games/" + current_rom_name + ".sav";
+                  File sf = LittleFS.open(sav_path, "w");
+                  if (sf) {
+                      sf.write(cart_ram, cart_ram_size);
+                      sf.close();
+                  }
               }
           }
 
@@ -236,16 +266,33 @@ jobs:
               f.read(rom_buffer, rom_size);
               f.close();
 
-              gb_init(&gb, &gb_rom_read, NULL, NULL, NULL, NULL);
+              enum gb_init_error_e ret = gb_init(&gb, &gb_rom_read, &gb_cart_ram_read, &gb_cart_ram_write, &gb_error, NULL);
+              if (ret != GB_INIT_NO_ERROR) return;
+
+              // কার্ট্রিজ র‍্যাম (Save Data) লোড করা
+              cart_ram_size = gb_get_save_size(&gb);
+              if (cart_ram) { free(cart_ram); cart_ram = NULL; }
+              if (cart_ram_size > 0) {
+                  cart_ram = (uint8_t *)ps_malloc(cart_ram_size);
+                  memset(cart_ram, 0, cart_ram_size);
+                  String sav_path = "/games/" + current_rom_name + ".sav";
+                  File sf = LittleFS.open(sav_path, "r");
+                  if (sf) {
+                      sf.read(cart_ram, cart_ram_size);
+                      sf.close();
+                  }
+              }
+
               gb_init_lcd(&gb, &lcd_draw_line);
               
-              WiFi.mode(WIFI_OFF);
+              WiFi.mode(WIFI_OFF); // থার্মাল কুলিং
 
               tft.fillScreen(TFT_BLACK);
               app_state = STATE_INGAME;
           }
 
           void save_state() {
+              save_battery_ram();
               String state_path = "/games/" + current_rom_name + ".state";
               File sf = LittleFS.open(state_path, "w");
               if (sf) {
@@ -297,6 +344,7 @@ jobs:
                   }
               }
 
+              // ব্রাইটনেস কন্ট্রোল ও লাইভ টেম্পারেচার প্যানেল
               y = 125;
               bool is_bright_sel = (home_selected == bright_idx);
               tft.fillRect(6, y - 2, 308, 48, is_bright_sel ? 0x0280 : 0x0841);
@@ -495,27 +543,30 @@ jobs:
                       else if (pause_selected == 1) { save_state(); app_state = STATE_INGAME; tft.fillScreen(TFT_BLACK); }
                       else if (pause_selected == 2) { load_state(); app_state = STATE_INGAME; tft.fillScreen(TFT_BLACK); }
                       else if (pause_selected == 3) { active_palette = (active_palette + 1) % 4; draw_pause_menu(); }
-                      else if (pause_selected == 4) { app_state = STATE_HOME; draw_home_ui(); }
+                      else if (pause_selected == 4) { save_battery_ram(); app_state = STATE_HOME; draw_home_ui(); }
                   }
                   delay(20);
               }
 
-              // ৪. গেমপ্লে লুপ
+              // ৪. গেমপ্লে লুপ (Peanut-GB ৬০ FPS)
               else if (app_state == STATE_INGAME) {
                   uint32_t frame_start = micros();
 
-                  gb.direct.joyp_bits.right = (joy_y > 3000) ? 0 : 1;
-                  gb.direct.joyp_bits.left  = (joy_y < 1000) ? 0 : 1;
-                  gb.direct.joyp_bits.up    = (joy_x < 1000) ? 0 : 1;
-                  gb.direct.joyp_bits.down  = (joy_x > 3000) ? 0 : 1;
+                  // সব বাটন রিসেট (১ = ছাড়া)
+                  gb.direct.joypad = 0xFF;
 
-                  gb.direct.joyp_bits.a      = digitalRead(PIN_B1);
-                  gb.direct.joyp_bits.b      = digitalRead(PIN_B2);
+                  gb.direct.joypad_bits.right = (joy_y > 3000) ? 0 : 1;
+                  gb.direct.joypad_bits.left  = (joy_y < 1000) ? 0 : 1;
+                  gb.direct.joypad_bits.up    = (joy_x < 1000) ? 0 : 1;
+                  gb.direct.joypad_bits.down  = (joy_x > 3000) ? 0 : 1;
+
+                  gb.direct.joypad_bits.a     = digitalRead(PIN_B1);
+                  gb.direct.joypad_bits.b     = digitalRead(PIN_B2);
                   
                   if (digitalRead(PIN_B1) == LOW && digitalRead(PIN_B2) == LOW) {
-                      gb.direct.joyp_bits.select = 0;
+                      gb.direct.joypad_bits.select = 0;
                   } else {
-                      gb.direct.joyp_bits.select = 1;
+                      gb.direct.joypad_bits.select = 1;
                   }
 
                   static unsigned long b3_hold = 0;
@@ -531,16 +582,15 @@ jobs:
                       }
                   } else {
                       if (b3_hold > 0 && millis() - b3_hold < 1000) {
-                          gb.direct.joyp_bits.start = 0;
+                          gb.direct.joypad_bits.start = 0;
                       } else {
-                          gb.direct.joyp_bits.start = 1;
+                          gb.direct.joypad_bits.start = 1;
                       }
                       b3_hold = 0;
                   }
 
                   gb_run_frame(&gb);
 
-                  // থার্মাল কুলিং স্লিপ
                   int32_t remaining = 16742 - (int32_t)(micros() - frame_start);
                   if (remaining > 500) {
                       delayMicroseconds(remaining);

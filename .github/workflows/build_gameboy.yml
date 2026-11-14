@@ -58,13 +58,12 @@ jobs:
               lovyan03/LovyanGFX @ ^1.1.16
           EOF
 
-          # ৪. ফুল C++ সোর্স কোড (RGB555_TO_RGB444 ও পিকো ম্যাক্রো ফিক্সড)
+          # ৪. ফুল C++ সোর্স কোড (LCD_PALETTE_BG ফিক্সড + ফুল GBC কালার)
           cat << 'EOF' > gb_project/src/main.cpp
           #define LGFX_USE_V1
           #define ENABLE_LCD 1
           #define ENABLE_SOUND 0
           #define PEANUT_FULL_GBC_SUPPORT 1
-          #define PEANUT_GB_12_COLOUR 0
 
           // Raspberry Pi Pico SDK ও RGB444 ম্যাক্রো বাইপাস
           #ifndef __not_in_flash_func

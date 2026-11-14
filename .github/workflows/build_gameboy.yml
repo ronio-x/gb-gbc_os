@@ -16,7 +16,7 @@ jobs:
           sudo apt-get install -y python3 python3-pip
           pip3 install --upgrade platformio esptool
 
-      - name: Generate Complete GB & GBC Console Project
+      - name: Generate Exact 1:1 Speed Dual-Core GameBoy Console
         run: |
           mkdir -p gb_project/src
           mkdir -p gb_project/include
@@ -58,14 +58,13 @@ jobs:
               lovyan03/LovyanGFX @ ^1.1.16
           EOF
 
-          # ৪. ফুল C++ সোর্স কোড (LCD_PALETTE_BG ফিক্সড + ফুল GBC কালার)
+          # ৪. ডুয়াল-কোর ১:১ রিয়েল-টাইম স্পিড C++ সোর্স কোড
           cat << 'EOF' > gb_project/src/main.cpp
           #define LGFX_USE_V1
           #define ENABLE_LCD 1
           #define ENABLE_SOUND 0
           #define PEANUT_FULL_GBC_SUPPORT 1
 
-          // Raspberry Pi Pico SDK ও RGB444 ম্যাক্রো বাইপাস
           #ifndef __not_in_flash_func
           #define __not_in_flash_func(x) x
           #endif
@@ -133,8 +132,16 @@ jobs:
               }
           };
           LGFX tft;
-          LGFX_Sprite game_sprite(&tft);
+
+          // ডুয়াল-বাফার ডাবল স্প্রাইট (নিরবচ্ছিন্ন ডিসপ্লে ট্রান্সফারের জন্য)
+          LGFX_Sprite sprite0(&tft);
+          LGFX_Sprite sprite1(&tft);
+          LGFX_Sprite *render_sprite = &sprite0;
+          LGFX_Sprite *disp_sprite   = &sprite1;
           uint16_t *sprite_buf = NULL;
+
+          TaskHandle_t displayTaskHandle = NULL;
+          volatile bool display_busy = false;
 
           #define PIN_JOY_X 1
           #define PIN_JOY_Y 2
@@ -154,11 +161,10 @@ jobs:
           uint8_t y_start_lut[144];
           uint8_t y_end_lut[144];
 
-          // সঠিক অর্ডারের প্যালেট (0 = সবচেয়ে উজ্জ্বল/সাদা, 3 = সবচেয়ে গাঢ়/কালো)
           uint16_t palettes[4][4] = {
-              { 0xFFFF, 0xAD55, 0x52AA, 0x0000 }, // 0: ORIG COLOR (GBC আসল রঙ, DMG তে সাদা-কালো)
+              { 0xFFFF, 0xAD55, 0x52AA, 0x0000 }, // 0: ORIG COLOR
               { 0xFFFF, 0xB596, 0x528A, 0x0000 }, // 1: MONOCHROME B&W
-              { 0xF77B, 0xC5D3, 0x7309, 0x18C2 }, // 2: EYE-COMFORT (উষ্ণ ক্রিম পেপার ও কালি)
+              { 0xF77B, 0xC5D3, 0x7309, 0x18C2 }, // 2: EYE-COMFORT
               { 0xFFAE, 0xFEA0, 0xB300, 0x2080 }  // 3: WARM AMBER
           };
           const char* pal_names[4] = { "ORIG COLOR", "MONO B&W", "EYE COMFORT", "WARM AMBER" };
@@ -176,6 +182,17 @@ jobs:
           ConsoleState app_state = STATE_HOME;
           int pause_selected = 0;
           int confirm_selected = 1;
+
+          // Core 0 ব্যাকগ্রাউন্ড ডিসপ্লে টাস্ক (SPI DMA ট্রান্সফার)
+          void displayTask(void *pvParameters) {
+              for (;;) {
+                  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+                  if (disp_sprite) {
+                      disp_sprite->pushSprite(27, 0);
+                  }
+                  display_busy = false;
+              }
+          }
 
           void init_luts() {
               for (int x = 0; x < 266; x++) x_lut[x] = (x * 160) / 266;
@@ -222,6 +239,7 @@ jobs:
 
           void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t val) {}
 
+          // Core 1 শুধু র‍্যাম বাফারে লিখে যাবে (SPI এর জন্য অপেক্ষা করবে না!)
           void lcd_draw_line(struct gb_s *gb_ptr, const uint8_t pixels[160], const uint_fast8_t line) {
               if (!sprite_buf) return;
 
@@ -261,8 +279,17 @@ jobs:
                   memcpy(sprite_buf + (y * 266), dst_row, 532);
               }
 
+              // শেষ লাইনে বাফার সোয়াপ করে Core 0 কে পাঠানো
               if (line == 143) {
-                  game_sprite.pushSprite(27, 0);
+                  if (!display_busy && displayTaskHandle != NULL) {
+                      LGFX_Sprite *tmp = render_sprite;
+                      render_sprite = disp_sprite;
+                      disp_sprite = tmp;
+                      sprite_buf = (uint16_t *)render_sprite->getBuffer();
+
+                      display_busy = true;
+                      xTaskNotifyGive(displayTaskHandle);
+                  }
               }
           }
 
@@ -278,6 +305,7 @@ jobs:
           }
 
           void return_to_master_launcher() {
+              while (display_busy) delay(1);
               tft.fillScreen(TFT_BLACK);
               tft.setTextColor(0x07E0);
               tft.setTextSize(2);
@@ -310,6 +338,7 @@ jobs:
           }
 
           void show_load_error(String msg) {
+              while (display_busy) delay(1);
               tft.fillScreen(TFT_BLACK);
               tft.setTextColor(TFT_RED);
               tft.setTextSize(2);
@@ -321,6 +350,7 @@ jobs:
           }
 
           void start_game(String filename) {
+              while (display_busy) delay(1);
               tft.fillScreen(TFT_BLACK);
               tft.setTextColor(0x07E0);
               tft.setTextSize(2);
@@ -384,6 +414,7 @@ jobs:
           }
 
           void draw_home_ui() {
+              while (display_busy) delay(1);
               tft.fillScreen(TFT_BLACK);
 
               int total_games = game_files.size();
@@ -472,6 +503,7 @@ jobs:
           }
 
           void draw_confirm_dialog() {
+              while (display_busy) delay(1);
               tft.fillRect(35, 45, 250, 140, 0x0841);
               tft.drawRect(35, 45, 250, 140, TFT_WHITE);
               tft.setTextColor(TFT_WHITE);
@@ -501,6 +533,7 @@ jobs:
           }
 
           void draw_pause_menu() {
+              while (display_busy) delay(1);
               tft.fillRect(25, 13, 270, 214, 0x0841);
               tft.drawRect(25, 13, 270, 214, 0x07E0);
               tft.setTextColor(0x07E0);
@@ -538,13 +571,21 @@ jobs:
               tft.invertDisplay(false);
               tft.fillScreen(TFT_BLACK);
 
-              game_sprite.setPsram(false);
-              game_sprite.setColorDepth(16);
-              if (!game_sprite.createSprite(266, 240)) {
-                  game_sprite.setPsram(true);
-                  game_sprite.createSprite(266, 240);
-              }
-              sprite_buf = (uint16_t *)game_sprite.getBuffer();
+              // ডাবল বাফার PSRAM-এ তৈরি (SPI DMA ও CPU আলাদা কোরে কাজ করার জন্য)
+              sprite0.setPsram(true);
+              sprite0.setColorDepth(16);
+              sprite0.createSprite(266, 240);
+
+              sprite1.setPsram(true);
+              sprite1.setColorDepth(16);
+              sprite1.createSprite(266, 240);
+
+              render_sprite = &sprite0;
+              disp_sprite   = &sprite1;
+              sprite_buf    = (uint16_t *)render_sprite->getBuffer();
+
+              // Core 0-তে ডিসপ্লে টাস্ক শুরু
+              xTaskCreatePinnedToCore(displayTask, "DispTask", 4096, NULL, 2, &displayTaskHandle, 0);
 
               pinMode(PIN_B1, INPUT_PULLUP);
               pinMode(PIN_B2, INPUT_PULLUP);
@@ -639,15 +680,16 @@ jobs:
 
                   if (digitalRead(PIN_B1) == LOW && millis() - last_input > 250) {
                       last_input = millis();
-                      if (pause_selected == 0) { app_state = STATE_INGAME; tft.fillScreen(TFT_BLACK); }
-                      else if (pause_selected == 1) { save_state(); app_state = STATE_INGAME; tft.fillScreen(TFT_BLACK); }
-                      else if (pause_selected == 2) { load_state(); app_state = STATE_INGAME; tft.fillScreen(TFT_BLACK); }
+                      if (pause_selected == 0) { app_state = STATE_INGAME; while(display_busy) delay(1); tft.fillScreen(TFT_BLACK); }
+                      else if (pause_selected == 1) { save_state(); app_state = STATE_INGAME; while(display_busy) delay(1); tft.fillScreen(TFT_BLACK); }
+                      else if (pause_selected == 2) { load_state(); app_state = STATE_INGAME; while(display_busy) delay(1); tft.fillScreen(TFT_BLACK); }
                       else if (pause_selected == 3) { active_palette = (active_palette + 1) % 4; draw_pause_menu(); }
                       else if (pause_selected == 4) { save_battery_ram(); app_state = STATE_HOME; draw_home_ui(); }
                   }
                   if (digitalRead(PIN_B2) == LOW && millis() - last_input > 250) {
                       last_input = millis();
                       app_state = STATE_INGAME;
+                      while (display_busy) delay(1);
                       tft.fillScreen(TFT_BLACK);
                   }
                   delay(20);
@@ -693,10 +735,16 @@ jobs:
                       b3_hold = 0;
                   }
 
+                  // Core 1-এ আসল ৬০ FPS এ গেম এক্সিকিউট (SPI ছাড়াই)
                   gb_run_frame(&gb);
 
+                  // ১:১ রিয়েল-টাইম (১৬,৭৪২ মাইক্রো-সেকেন্ড) এবং কুলিং স্লিপ
                   int32_t remaining = 16742 - (int32_t)(micros() - frame_start);
-                  if (remaining > 500) {
+                  if (remaining > 1000) {
+                      delay(remaining / 1000);
+                      int32_t sub_rem = remaining % 1000;
+                      if (sub_rem > 50) delayMicroseconds(sub_rem);
+                  } else if (remaining > 50) {
                       delayMicroseconds(remaining);
                   }
               }

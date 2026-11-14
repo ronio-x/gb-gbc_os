@@ -34,7 +34,7 @@ jobs:
           vfs,      data, fat,     0x720000, 0x8e0000,
           EOF
 
-          # ৩. PlatformIO কনফিগারেশন (O3 স্পিড + GBC সাপোর্ট + Octal PSRAM)
+          # ৩. PlatformIO কনফিগারেশন
           cat << 'EOF' > gb_project/platformio.ini
           [env:esp32-s3-gameboy]
           platform = espressif32
@@ -58,14 +58,15 @@ jobs:
               lovyan03/LovyanGFX @ ^1.1.16
           EOF
 
-          # ৪. ফুল C++ সোর্স কোড (পিকো ম্যাক্রো ফিক্স + ফুল GBC কালার + সব অপটিমাইজেশন)
+          # ৪. ফুল C++ সোর্স কোড (RGB555_TO_RGB444 ও পিকো ম্যাক্রো ফিক্সড)
           cat << 'EOF' > gb_project/src/main.cpp
           #define LGFX_USE_V1
           #define ENABLE_LCD 1
           #define ENABLE_SOUND 0
           #define PEANUT_FULL_GBC_SUPPORT 1
+          #define PEANUT_GB_12_COLOUR 0
 
-          // Raspberry Pi Pico SDK ম্যাক্রো বাইপাস (ESP32 কম্প্যাটিবিলিটির জন্য)
+          // Raspberry Pi Pico SDK ও RGB444 ম্যাক্রো বাইপাস
           #ifndef __not_in_flash_func
           #define __not_in_flash_func(x) x
           #endif
@@ -77,6 +78,9 @@ jobs:
           #endif
           #ifndef __force_inline
           #define __force_inline inline __attribute__((always_inline))
+          #endif
+          #ifndef RGB555_TO_RGB444
+          #define RGB555_TO_RGB444(x) (x)
           #endif
 
           #include <LovyanGFX.hpp>
@@ -151,7 +155,7 @@ jobs:
           uint8_t y_start_lut[144];
           uint8_t y_end_lut[144];
 
-          // সঠিক অর্ডারের প্যালেট (0 = সবচেয়ে উজ্জ্বল/সাদা, 3 = সবচেয়ে গাঢ়/কালো — কোনো নেগেটিভ হবে না!)
+          // সঠিক অর্ডারের প্যালেট (0 = সবচেয়ে উজ্জ্বল/সাদা, 3 = সবচেয়ে গাঢ়/কালো)
           uint16_t palettes[4][4] = {
               { 0xFFFF, 0xAD55, 0x52AA, 0x0000 }, // 0: ORIG COLOR (GBC আসল রঙ, DMG তে সাদা-কালো)
               { 0xFFFF, 0xB596, 0x528A, 0x0000 }, // 1: MONOCHROME B&W
@@ -219,7 +223,6 @@ jobs:
 
           void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t val) {}
 
-          // ডিরেক্ট র‍্যাম রেন্ডারিং (ফ্রেম স্কিপ ছাড়াই এবং ফুল GBC কালার সাপোর্ট)
           void lcd_draw_line(struct gb_s *gb_ptr, const uint8_t pixels[160], const uint_fast8_t line) {
               if (!sprite_buf) return;
 
@@ -227,14 +230,12 @@ jobs:
 
               if (gb_ptr->cgb.cgbMode) {
                   if (active_palette == 0) {
-                      // আসল GBC ১৫-বিট কালার থেকে RGB565 তে রূপান্তর
                       for (int x = 0; x < 266; x++) {
                           uint16_t rgb555 = gb_ptr->cgb.fixPalette[pixels[x_lut[x]] & 0x3F];
                           uint16_t c = ((rgb555 & 0x7FE0) << 1) | ((rgb555 & 0x0200) >> 4) | (rgb555 & 0x001F);
                           dst_row[x] = (c >> 8) | (c << 8);
                       }
                   } else {
-                      // GBC গেমকে মনক্রোম বা আই-কমফোর্ট প্যালেটে কনভার্ট
                       uint16_t *pal = palettes[active_palette];
                       for (int x = 0; x < 266; x++) {
                           uint16_t rgb555 = gb_ptr->cgb.fixPalette[pixels[x_lut[x]] & 0x3F];
@@ -248,7 +249,6 @@ jobs:
                       }
                   }
               } else {
-                  // ক্লাসিক গেমবয় (DMG) — সঠিক সাদা থেকে কালো অর্ডার
                   uint16_t *pal = palettes[active_palette];
                   for (int x = 0; x < 266; x++) {
                       uint16_t c = pal[pixels[x_lut[x]] & 3];

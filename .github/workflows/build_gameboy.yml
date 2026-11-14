@@ -16,7 +16,7 @@ jobs:
           sudo apt-get install -y python3 python3-pip
           pip3 install --upgrade platformio esptool
 
-      - name: Generate Exact 1:1 Speed Dual-Core GameBoy Console
+      - name: Generate Final Tuned GB & GBC Console Project
         run: |
           mkdir -p gb_project/src
           mkdir -p gb_project/include
@@ -58,7 +58,7 @@ jobs:
               lovyan03/LovyanGFX @ ^1.1.16
           EOF
 
-          # ৪. ডুয়াল-কোর ১:১ রিয়েল-টাইম স্পিড C++ সোর্স কোড
+          # ৪. চূড়ান্ত ফাইনাল C++ সোর্স কোড
           cat << 'EOF' > gb_project/src/main.cpp
           #define LGFX_USE_V1
           #define ENABLE_LCD 1
@@ -133,7 +133,6 @@ jobs:
           };
           LGFX tft;
 
-          // ডুয়াল-বাফার ডাবল স্প্রাইট (নিরবচ্ছিন্ন ডিসপ্লে ট্রান্সফারের জন্য)
           LGFX_Sprite sprite0(&tft);
           LGFX_Sprite sprite1(&tft);
           LGFX_Sprite *render_sprite = &sprite0;
@@ -142,11 +141,12 @@ jobs:
 
           TaskHandle_t displayTaskHandle = NULL;
           volatile bool display_busy = false;
+          volatile bool skip_lcd_render = false;
 
           #define PIN_JOY_X 1
           #define PIN_JOY_Y 2
-          #define PIN_B1    5   // A
-          #define PIN_B2    6   // B
+          #define PIN_B1    5   // A / Select
+          #define PIN_B2    6   // B / Back
           #define PIN_B3    40  // Start / Menu
 
           uint8_t *rom_buffer = NULL;
@@ -157,33 +157,64 @@ jobs:
           String current_rom_path = "";
           String current_rom_name = "";
 
+          // স্মার্ট অটো-সেভ ভ্যারিয়েবল
+          volatile bool ram_dirty = false;
+          unsigned long last_ram_write_ms = 0;
+
           uint8_t x_lut[266];
           uint8_t y_start_lut[144];
           uint8_t y_end_lut[144];
 
+          // গেম কালার প্যালেট
           uint16_t palettes[4][4] = {
               { 0xFFFF, 0xAD55, 0x52AA, 0x0000 }, // 0: ORIG COLOR
-              { 0xFFFF, 0xB596, 0x528A, 0x0000 }, // 1: MONOCHROME B&W
-              { 0xF77B, 0xC5D3, 0x7309, 0x18C2 }, // 2: EYE-COMFORT
+              { 0xFFFF, 0xB596, 0x528A, 0x0000 }, // 1: MONO B&W
+              { 0xF77B, 0xC5D3, 0x7309, 0x18C2 }, // 2: EYE COMFORT
               { 0xFFAE, 0xFEA0, 0xB300, 0x2080 }  // 3: WARM AMBER
           };
           const char* pal_names[4] = { "ORIG COLOR", "MONO B&W", "EYE COMFORT", "WARM AMBER" };
           int active_palette = 0;
 
+          // ৪টি কনসোল UI থিম
+          struct UITheme {
+              const char* name;
+              uint16_t primary;
+              uint16_t dark_card;
+          };
+          UITheme ui_themes[4] = {
+              { "HACKER GREEN", 0x07E0, 0x0120 },
+              { "AMBER GOLD",   0xFD20, 0x2080 },
+              { "CYBER CYAN",   0x07FF, 0x0188 },
+              { "RETRO MONO",   0xFFFF, 0x2104 }
+          };
+          int active_theme = 0;
+
           int backlight_pct = 80;
-          int cpu_temp_c = 38;
+          int game_speed = 1; // 1x, 2x, 3x
+
+          // ৩০ সেকেন্ড আইডল স্লিপ (শুধু মেনুতে)
+          #define MENU_IDLE_TIMEOUT_MS 30000
+          unsigned long last_activity_ms = 0;
+          bool is_sleeping = false;
 
           std::vector<String> game_files;
           int home_selected = 0;
           int game_scroll_top = 0;
-          const int VISIBLE_GAMES = 3;
+          const int VISIBLE_GAMES = 6;
 
-          enum ConsoleState { STATE_HOME, STATE_INGAME, STATE_PAUSED, STATE_CONFIRM_EXIT };
+          enum ConsoleState { STATE_HOME, STATE_HOME_MENU, STATE_INGAME, STATE_PAUSED, STATE_CONFIRM_EXIT };
           ConsoleState app_state = STATE_HOME;
+          int home_menu_sel = 0;
           int pause_selected = 0;
           int confirm_selected = 1;
 
-          // Core 0 ব্যাকগ্রাউন্ড ডিসপ্লে টাস্ক (SPI DMA ট্রান্সফার)
+          // ফরওয়ার্ড ডিক্লেয়ারেশন
+          void draw_home_ui();
+          void draw_home_menu();
+          void draw_pause_menu();
+          void draw_confirm_dialog();
+
+          // Core 0 ডিসপ্লে টাস্ক
           void displayTask(void *pvParameters) {
               for (;;) {
                   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -202,26 +233,44 @@ jobs:
               }
           }
 
-          void load_saved_brightness() {
-              File f = LittleFS.open("/backlight.cfg", "r");
-              if (f) {
-                  String val = f.readStringUntil('\n');
+          void load_configs() {
+              File fb = LittleFS.open("/backlight.cfg", "r");
+              if (fb) {
+                  String val = fb.readStringUntil('\n');
                   val.trim();
                   int b = val.toInt();
                   if (b >= 5 && b <= 100) backlight_pct = b;
-                  f.close();
+                  fb.close();
               }
               tft.setBrightness((backlight_pct * 255) / 100);
+
+              File ft = LittleFS.open("/gb_theme.cfg", "r");
+              if (ft) {
+                  String val = ft.readStringUntil('\n');
+                  val.trim();
+                  int t = val.toInt();
+                  if (t >= 0 && t < 4) active_theme = t;
+                  ft.close();
+              }
           }
 
           void save_brightness(int val) {
               backlight_pct = constrain(val, 5, 100);
-              tft.setBrightness((backlight_pct * 255) / 100);
+              if (!is_sleeping) tft.setBrightness((backlight_pct * 255) / 100);
               File f = LittleFS.open("/backlight.cfg", "w");
-              if (f) {
-                  f.print(backlight_pct);
-                  f.close();
-              }
+              if (f) { f.print(backlight_pct); f.close(); }
+          }
+
+          void save_theme(int t) {
+              active_theme = t % 4;
+              File f = LittleFS.open("/gb_theme.cfg", "w");
+              if (f) { f.print(active_theme); f.close(); }
+          }
+
+          uint16_t get_temp_color(int t) {
+              if (t < 50) return 0x07E0;       // ঠান্ডা / স্বাভাবিক (সবুজ)
+              if (t < 69) return TFT_YELLOW;   // ওয়ার্ম (হলুদ)
+              return TFT_RED;                  // বিপদসীমা (লাল)
           }
 
           static inline uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr) {
@@ -234,14 +283,19 @@ jobs:
           }
 
           void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr, const uint8_t val) {
-              if (cart_ram && addr < cart_ram_size) cart_ram[addr] = val;
+              if (cart_ram && addr < cart_ram_size) {
+                  if (cart_ram[addr] != val) {
+                      cart_ram[addr] = val;
+                      ram_dirty = true;
+                      last_ram_write_ms = millis();
+                  }
+              }
           }
 
           void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t val) {}
 
-          // Core 1 শুধু র‍্যাম বাফারে লিখে যাবে (SPI এর জন্য অপেক্ষা করবে না!)
           void lcd_draw_line(struct gb_s *gb_ptr, const uint8_t pixels[160], const uint_fast8_t line) {
-              if (!sprite_buf) return;
+              if (skip_lcd_render || !sprite_buf) return;
 
               uint16_t *dst_row = sprite_buf + (y_start_lut[line] * 266);
 
@@ -279,7 +333,6 @@ jobs:
                   memcpy(sprite_buf + (y * 266), dst_row, 532);
               }
 
-              // শেষ লাইনে বাফার সোয়াপ করে Core 0 কে পাঠানো
               if (line == 143) {
                   if (!display_busy && displayTaskHandle != NULL) {
                       LGFX_Sprite *tmp = render_sprite;
@@ -295,19 +348,23 @@ jobs:
 
           void save_battery_ram() {
               if (cart_ram && cart_ram_size > 0 && current_rom_name != "") {
+                  while (display_busy) delay(1);
                   String sav_path = "/games/" + current_rom_name + ".sav";
                   File sf = LittleFS.open(sav_path, "w");
                   if (sf) {
                       sf.write(cart_ram, cart_ram_size);
+                      sf.flush();
                       sf.close();
                   }
+                  ram_dirty = false;
               }
           }
 
           void return_to_master_launcher() {
+              if (ram_dirty) save_battery_ram();
               while (display_busy) delay(1);
               tft.fillScreen(TFT_BLACK);
-              tft.setTextColor(0x07E0);
+              tft.setTextColor(ui_themes[active_theme].primary);
               tft.setTextSize(2);
               tft.drawCenterString("REBOOTING TO LAUNCHER...", 160, 110);
               delay(500);
@@ -352,7 +409,7 @@ jobs:
           void start_game(String filename) {
               while (display_busy) delay(1);
               tft.fillScreen(TFT_BLACK);
-              tft.setTextColor(0x07E0);
+              tft.setTextColor(ui_themes[active_theme].primary);
               tft.setTextSize(2);
               tft.drawCenterString("LOADING ROM...", 160, 100);
 
@@ -394,6 +451,8 @@ jobs:
                   }
               }
 
+              ram_dirty = false;
+              game_speed = 1;
               gb_init_lcd(&gb, &lcd_draw_line);
               tft.fillScreen(TFT_BLACK);
               app_state = STATE_INGAME;
@@ -402,108 +461,152 @@ jobs:
 
           void save_state() {
               save_battery_ram();
+              while (display_busy) delay(1);
               String state_path = "/games/" + current_rom_name + ".state";
               File sf = LittleFS.open(state_path, "w");
               if (sf) { sf.write((uint8_t*)&gb, sizeof(struct gb_s)); sf.close(); }
           }
 
           void load_state() {
+              while (display_busy) delay(1);
               String state_path = "/games/" + current_rom_name + ".state";
               File sf = LittleFS.open(state_path, "r");
               if (sf) { sf.read((uint8_t*)&gb, sizeof(struct gb_s)); sf.close(); }
+          }
+
+          void update_top_temp_only() {
+              if (app_state != STATE_HOME || is_sleeping) return;
+              int t = (int)temperatureRead();
+              uint16_t prim = ui_themes[active_theme].primary;
+              uint16_t card = ui_themes[active_theme].dark_card;
+              tft.fillRect(142, 2, 92, 20, card);
+              tft.setTextSize(2);
+              tft.setTextColor(get_temp_color(t));
+              tft.drawString("T:" + String(t) + "C", 146, 4);
           }
 
           void draw_home_ui() {
               while (display_busy) delay(1);
               tft.fillScreen(TFT_BLACK);
 
+              UITheme th = ui_themes[active_theme];
               int total_games = game_files.size();
-              int bright_idx = total_games;
-              int exit_idx = total_games + 1;
 
-              tft.fillRect(0, 0, 320, 24, 0x01E0);
-              tft.setTextColor(0x07E0);
+              // স্ট্যাটাস বার: বামে GAME BOY, মাঝে কালারফুল CPU Temp, ডানে [01/XX]
+              tft.fillRect(0, 0, 320, 24, th.dark_card);
+              tft.setTextColor(th.primary);
               tft.setTextSize(2);
-              tft.drawString("GAME BOY COLOR", 8, 4);
-              
-              tft.setTextSize(1);
+              tft.drawString("GAME BOY", 8, 4);
+
+              int t = (int)temperatureRead();
+              tft.setTextColor(get_temp_color(t));
+              tft.drawString("T:" + String(t) + "C", 146, 4);
+
               tft.setTextColor(TFT_WHITE);
               if (total_games > 0) {
-                  int show_g = (home_selected < total_games) ? (home_selected + 1) : total_games;
-                  tft.drawRightString("[" + String(show_g) + "/" + String(total_games) + "]", 312, 8);
+                  tft.drawRightString("[" + String(home_selected + 1) + "/" + String(total_games) + "]", 314, 4);
+              } else {
+                  tft.drawRightString("[0/0]", 314, 4);
               }
-              tft.drawFastHLine(0, 24, 320, 0x07E0);
+              tft.drawFastHLine(0, 24, 320, th.primary);
 
+              // শুধু গেম লিস্ট (একসাথে ৬টি গেম + স্ক্রোলবার)
               int y = 30;
               if (total_games == 0) {
                   tft.setTextColor(TFT_WHITE);
+                  tft.setTextSize(2);
+                  tft.drawCenterString("No games in /games!", 160, 80);
                   tft.setTextSize(1);
-                  tft.drawString("No games found in /games!", 15, 50);
+                  tft.setTextColor(th.primary);
+                  tft.drawCenterString("Press B3 for System Menu", 160, 120);
               } else {
                   tft.setTextSize(2);
                   for (int slot = 0; slot < VISIBLE_GAMES; slot++) {
                       int g_idx = game_scroll_top + slot;
                       if (g_idx < total_games) {
                           if (g_idx == home_selected) {
-                              tft.fillRect(6, y - 2, 300, 28, 0x07E0);
+                              tft.fillRect(6, y - 2, 300, 28, th.primary);
                               tft.setTextColor(TFT_BLACK);
                           } else {
-                              tft.fillRect(6, y - 2, 300, 28, 0x0120);
+                              tft.fillRect(6, y - 2, 300, 28, th.dark_card);
                               tft.setTextColor(TFT_WHITE);
                           }
                           String dname = game_files[g_idx];
                           if (dname.length() > 19) dname = dname.substring(0, 17) + "..";
                           tft.drawString(String(g_idx + 1) + ". " + dname, 12, y + 4);
-                          y += 31;
+                          y += 30;
                       }
                   }
 
+                  // ডানপাশে স্ক্রোলবার (সবসময় অক্ষত থাকবে)
+                  int bar_h = 178;
+                  tft.fillRect(312, 28, 4, bar_h, 0x2104);
+                  int thumb_h = bar_h;
+                  int thumb_y = 28;
                   if (total_games > VISIBLE_GAMES) {
-                      int bar_h = 90;
-                      tft.fillRect(312, 28, 4, bar_h, 0x2104);
-                      int thumb_h = max(18, (bar_h * VISIBLE_GAMES) / total_games);
-                      int thumb_y = 28 + ((bar_h - thumb_h) * game_scroll_top) / max(1, total_games - VISIBLE_GAMES);
-                      tft.fillRect(312, thumb_y, 4, thumb_h, 0x07E0);
+                      int calc_h = (bar_h * VISIBLE_GAMES) / total_games;
+                      thumb_h = (calc_h > 18) ? calc_h : 18;
+                      int max_top = total_games - VISIBLE_GAMES;
+                      thumb_y = 28 + ((bar_h - thumb_h) * game_scroll_top) / (max_top > 0 ? max_top : 1);
                   }
+                  tft.fillRect(312, thumb_y, 4, thumb_h, th.primary);
               }
 
-              y = 125;
-              bool is_bright_sel = (home_selected == bright_idx);
-              tft.fillRect(6, y - 2, 308, 46, is_bright_sel ? 0x0280 : 0x0841);
-              tft.drawRect(6, y - 2, 308, 46, is_bright_sel ? 0x07E0 : 0x2104);
-
+              // ফুটার
+              tft.drawFastHLine(0, 214, 320, th.primary);
               tft.setTextSize(1);
-              tft.setTextColor(is_bright_sel ? 0x07E0 : TFT_WHITE);
-              tft.drawString("Brightness [< >]: " + String(backlight_pct) + "%", 14, y + 2);
+              tft.setTextColor(th.primary);
+              tft.drawString("Joy: Move  |  B1: Play  |  B3: Menu", 10, 223);
+          }
 
-              tft.drawRect(14, y + 13, 200, 10, TFT_WHITE);
-              tft.fillRect(16, y + 15, (backlight_pct * 196) / 100, 6, 0x07E0);
+          // হোম স্ক্রিন পপ-আপ মেনু (B3 চাপলে খুলবে)
+          void draw_home_menu() {
+              while (display_busy) delay(1);
+              UITheme th = ui_themes[active_theme];
 
-              cpu_temp_c = (int)temperatureRead();
-              tft.setTextColor(TFT_YELLOW);
-              tft.drawString("CPU Temp: " + String(cpu_temp_c) + " C", 14, y + 27);
-              tft.setTextColor(psramFound() ? TFT_GREEN : TFT_RED);
-              tft.drawRightString(psramFound() ? "PSRAM: 8MB" : "PSRAM: FAIL", 300, y + 27);
-
-              y = 176;
-              if (home_selected == exit_idx) {
-                  tft.fillRect(6, y, 308, 30, 0xE000);
-                  tft.setTextColor(TFT_WHITE);
-              } else {
-                  tft.fillRect(6, y, 308, 30, 0x3000);
-                  tft.setTextColor(TFT_LIGHTGRAY);
-              }
+              tft.fillRect(20, 22, 280, 196, 0x0841);
+              tft.drawRect(20, 22, 280, 196, th.primary);
+              tft.setTextColor(th.primary);
               tft.setTextSize(2);
-              tft.drawCenterString("EXIT TO LAUNCHER", 160, y + 7);
+              tft.drawCenterString("SYSTEM MENU", 160, 30);
+              tft.drawFastHLine(30, 52, 260, th.primary);
 
-              tft.drawFastHLine(0, 214, 320, 0x07E0);
+              // অপশন ০: ব্রাইটনেস কন্ট্রোল বার
+              int y = 60;
+              bool sel0 = (home_menu_sel == 0);
+              tft.fillRect(30, y, 260, 42, sel0 ? th.dark_card : 0x0000);
+              tft.drawRect(30, y, 260, 42, sel0 ? th.primary : 0x2104);
               tft.setTextSize(1);
-              tft.setTextColor(0x07E0);
-              tft.drawString("Joy: Move | B1: Select | Joy < >: Bright", 10, 222);
+              tft.setTextColor(sel0 ? th.primary : TFT_WHITE);
+              tft.drawString("Brightness [< >]: " + String(backlight_pct) + "%", 38, y + 6);
+              tft.drawRect(38, y + 20, 244, 12, TFT_WHITE);
+              tft.fillRect(40, y + 22, (backlight_pct * 240) / 100, 8, th.primary);
+
+              // অপশন ১: ৪টি থিম সিলেকশন
+              y = 108;
+              bool sel1 = (home_menu_sel == 1);
+              tft.fillRect(30, y, 260, 32, sel1 ? th.primary : th.dark_card);
+              tft.setTextColor(sel1 ? TFT_BLACK : TFT_WHITE);
+              tft.setTextSize(2);
+              tft.drawString("Theme: " + String(th.name), 38, y + 8);
+
+              // অপশন ২: এক্সিট টু লঞ্চার
+              y = 148;
+              bool sel2 = (home_menu_sel == 2);
+              tft.fillRect(30, y, 260, 32, sel2 ? 0xE000 : 0x3000);
+              tft.setTextColor(TFT_WHITE);
+              tft.setTextSize(2);
+              tft.drawCenterString("EXIT TO LAUNCHER", 160, y + 8);
+
+              // নিচে ছোট ক্রেডিট টেক্সট
+              tft.setTextSize(1);
+              tft.setTextColor(TFT_LIGHTGRAY);
+              tft.drawCenterString("dev:github/ronio_x", 160, 198);
           }
 
           void draw_confirm_dialog() {
               while (display_busy) delay(1);
+              UITheme th = ui_themes[active_theme];
               tft.fillRect(35, 45, 250, 140, 0x0841);
               tft.drawRect(35, 45, 250, 140, TFT_WHITE);
               tft.setTextColor(TFT_WHITE);
@@ -513,7 +616,7 @@ jobs:
               tft.drawCenterString("Return to Multi-Boot Launcher?", 160, 92);
 
               if (confirm_selected == 0) {
-                  tft.fillRect(55, 125, 85, 34, 0x07E0);
+                  tft.fillRect(55, 125, 85, 34, th.primary);
                   tft.setTextColor(TFT_BLACK);
               } else {
                   tft.fillRect(55, 125, 85, 34, 0x18E3);
@@ -534,33 +637,36 @@ jobs:
 
           void draw_pause_menu() {
               while (display_busy) delay(1);
-              tft.fillRect(25, 13, 270, 214, 0x0841);
-              tft.drawRect(25, 13, 270, 214, 0x07E0);
-              tft.setTextColor(0x07E0);
-              tft.setTextSize(2);
-              tft.drawCenterString("GAME PAUSED", 160, 22);
-              tft.drawFastHLine(35, 44, 250, 0x07E0);
+              UITheme th = ui_themes[active_theme];
 
-              String p_opts[5] = {
+              tft.fillRect(25, 8, 270, 224, 0x0841);
+              tft.drawRect(25, 8, 270, 224, th.primary);
+              tft.setTextColor(th.primary);
+              tft.setTextSize(2);
+              tft.drawCenterString("GAME PAUSED", 160, 14);
+              tft.drawFastHLine(35, 34, 250, th.primary);
+
+              String p_opts[6] = {
                   "1. Resume Game",
                   "2. Save Status",
                   "3. Load Status",
-                  "4. " + String(pal_names[active_palette]),
-                  "5. Exit to Home"
+                  "4. Speed: " + String(game_speed) + "x",
+                  "5. " + String(pal_names[active_palette]),
+                  "6. Exit to Home"
               };
 
-              int y = 54;
-              for (int i = 0; i < 5; i++) {
+              int y = 42;
+              for (int i = 0; i < 6; i++) {
                   if (i == pause_selected) {
-                      tft.fillRect(35, y - 2, 250, 28, 0x07E0);
+                      tft.fillRect(35, y - 2, 250, 26, th.primary);
                       tft.setTextColor(TFT_BLACK);
                   } else {
-                      tft.fillRect(35, y - 2, 250, 28, 0x0120);
+                      tft.fillRect(35, y - 2, 250, 26, th.dark_card);
                       tft.setTextColor(TFT_WHITE);
                   }
                   tft.setTextSize(2);
-                  tft.drawString(p_opts[i], 45, y + 4);
-                  y += 33;
+                  tft.drawString(p_opts[i], 45, y + 3);
+                  y += 30;
               }
           }
 
@@ -571,7 +677,6 @@ jobs:
               tft.invertDisplay(false);
               tft.fillScreen(TFT_BLACK);
 
-              // ডাবল বাফার PSRAM-এ তৈরি (SPI DMA ও CPU আলাদা কোরে কাজ করার জন্য)
               sprite0.setPsram(true);
               sprite0.setColorDepth(16);
               sprite0.createSprite(266, 240);
@@ -584,7 +689,6 @@ jobs:
               disp_sprite   = &sprite1;
               sprite_buf    = (uint16_t *)render_sprite->getBuffer();
 
-              // Core 0-তে ডিসপ্লে টাস্ক শুরু
               xTaskCreatePinnedToCore(displayTask, "DispTask", 4096, NULL, 2, &displayTaskHandle, 0);
 
               pinMode(PIN_B1, INPUT_PULLUP);
@@ -592,101 +696,193 @@ jobs:
               pinMode(PIN_B3, INPUT_PULLUP);
 
               LittleFS.begin(false, "/vfs", 10, "vfs");
-              load_saved_brightness();
+              load_configs();
 
               scan_games();
+              last_activity_ms = millis();
               draw_home_ui();
           }
 
           void loop() {
               static unsigned long last_input = 0;
+              static unsigned long last_temp_refresh = 0;
 
+              int joy_x = analogRead(PIN_JOY_X);
+              int joy_y = analogRead(PIN_JOY_Y);
+              bool b1_down = (digitalRead(PIN_B1) == LOW);
+              bool b2_down = (digitalRead(PIN_B2) == LOW);
+              bool b3_down = (digitalRead(PIN_B3) == LOW);
+              bool joy_moved = (joy_x > 3000 || joy_x < 1000 || joy_y > 3000 || joy_y < 1000);
+
+              // ৩০ সেকেন্ড অটো-স্লিপ ও ওয়েক-আপ গার্ড (শুধু মেনুতে, গেমে নয়)
+              if (app_state != STATE_INGAME) {
+                  if (joy_moved || b1_down || b2_down || b3_down) {
+                      last_activity_ms = millis();
+                      if (is_sleeping) {
+                          is_sleeping = false;
+                          tft.setBrightness((backlight_pct * 255) / 100);
+                          delay(250);
+                          return;
+                      }
+                  } else if (!is_sleeping && (millis() - last_activity_ms > MENU_IDLE_TIMEOUT_MS)) {
+                      is_sleeping = true;
+                      tft.setBrightness(0);
+                  }
+
+                  if (is_sleeping) {
+                      delay(50);
+                      return;
+                  }
+              } else {
+                  last_activity_ms = millis();
+              }
+
+              // --- ১. হোম স্ক্রিন (শুধু গেম লিস্ট) ---
               if (app_state == STATE_HOME) {
-                  int joy_x = analogRead(PIN_JOY_X);
-                  int joy_y = analogRead(PIN_JOY_Y);
                   int total_games = game_files.size();
-                  int bright_idx = total_games;
-                  int exit_idx = total_games + 1;
-                  int total_options = total_games + 2;
 
-                  if (millis() - last_input > 200) {
+                  // প্রতি ২ সেকেন্ডে টপ বারে CPU Temp রিফ্রেশ
+                  if (millis() - last_temp_refresh > 2000) {
+                      update_top_temp_only();
+                      last_temp_refresh = millis();
+                  }
+
+                  if (millis() - last_input > 200 && total_games > 0) {
                       if (joy_x > 3000 && home_selected > 0) {
                           home_selected--;
-                          if (home_selected < total_games && home_selected < game_scroll_top) {
-                              game_scroll_top = home_selected;
-                          }
+                          if (home_selected < game_scroll_top) game_scroll_top = home_selected;
                           draw_home_ui();
                           last_input = millis();
-                      } else if (joy_x < 1000 && home_selected < total_options - 1) {
+                      } else if (joy_x < 1000 && home_selected < total_games - 1) {
                           home_selected++;
-                          if (home_selected < total_games && home_selected >= game_scroll_top + VISIBLE_GAMES) {
+                          if (home_selected >= game_scroll_top + VISIBLE_GAMES) {
                               game_scroll_top = home_selected - VISIBLE_GAMES + 1;
                           }
                           draw_home_ui();
                           last_input = millis();
                       }
+                  }
 
-                      if (home_selected == bright_idx) {
+                  // B1: গেম প্লে
+                  if (b1_down && millis() - last_input > 250) {
+                      last_input = millis();
+                      if (total_games > 0 && home_selected < total_games) {
+                          start_game(game_files[home_selected]);
+                          if (app_state != STATE_INGAME) draw_home_ui();
+                      }
+                  }
+
+                  // B3: হোম সিস্টেম মেনু ওপেন
+                  if (b3_down && millis() - last_input > 250) {
+                      last_input = millis();
+                      app_state = STATE_HOME_MENU;
+                      home_menu_sel = 0;
+                      draw_home_menu();
+                  }
+                  delay(20);
+              }
+              // --- ২. হোম সিস্টেম মেনু (ব্রাইটনেস, ৪ থিম, এক্সিট ও ক্রেডিট) ---
+              else if (app_state == STATE_HOME_MENU) {
+                  if (millis() - last_input > 200) {
+                      if (joy_x > 3000 && home_menu_sel > 0) {
+                          home_menu_sel--;
+                          draw_home_menu();
+                          last_input = millis();
+                      } else if (joy_x < 1000 && home_menu_sel < 2) {
+                          home_menu_sel++;
+                          draw_home_menu();
+                          last_input = millis();
+                      }
+
+                      // ব্রাইটনেস কন্ট্রোল (< >)
+                      if (home_menu_sel == 0) {
                           if (joy_y > 3000 && backlight_pct < 100) {
                               save_brightness(backlight_pct + 10);
-                              draw_home_ui();
+                              draw_home_menu();
                               last_input = millis();
                           } else if (joy_y < 1000 && backlight_pct > 10) {
                               save_brightness(backlight_pct - 10);
-                              draw_home_ui();
+                              draw_home_menu();
+                              last_input = millis();
+                          }
+                      }
+
+                      // থিম কন্ট্রোল (< >)
+                      if (home_menu_sel == 1) {
+                          if (joy_y > 3000) {
+                              save_theme(active_theme + 1);
+                              draw_home_menu();
+                              last_input = millis();
+                          } else if (joy_y < 1000) {
+                              save_theme((active_theme + 3) % 4);
+                              draw_home_menu();
                               last_input = millis();
                           }
                       }
                   }
 
-                  if (digitalRead(PIN_B1) == LOW && millis() - last_input > 250) {
+                  if (b1_down && millis() - last_input > 250) {
                       last_input = millis();
-                      if (home_selected < total_games) {
-                          start_game(game_files[home_selected]);
-                          if (app_state != STATE_INGAME) draw_home_ui();
-                      } else if (home_selected == exit_idx) {
+                      if (home_menu_sel == 1) {
+                          save_theme(active_theme + 1);
+                          draw_home_menu();
+                      } else if (home_menu_sel == 2) {
                           app_state = STATE_CONFIRM_EXIT;
                           confirm_selected = 1;
                           draw_confirm_dialog();
                       }
                   }
-                  delay(20);
-              }
-              else if (app_state == STATE_CONFIRM_EXIT) {
-                  int joy_y = analogRead(PIN_JOY_Y);
-                  if (millis() - last_input > 200) {
-                      if (joy_y < 1000) { confirm_selected = 0; draw_confirm_dialog(); last_input = millis(); }
-                      if (joy_y > 3000) { confirm_selected = 1; draw_confirm_dialog(); last_input = millis(); }
-                  }
 
-                  if (digitalRead(PIN_B1) == LOW && millis() - last_input > 250) {
-                      last_input = millis();
-                      if (confirm_selected == 0) return_to_master_launcher();
-                      else { app_state = STATE_HOME; draw_home_ui(); }
-                  }
-                  if (digitalRead(PIN_B2) == LOW && millis() - last_input > 250) {
+                  // B2 বা B3: সিস্টেম মেনু ক্লোজ করে গেম লিস্টে ফেরা
+                  if ((b2_down || b3_down) && millis() - last_input > 250) {
                       last_input = millis();
                       app_state = STATE_HOME;
                       draw_home_ui();
                   }
                   delay(20);
               }
-              else if (app_state == STATE_PAUSED) {
-                  int joy_x = analogRead(PIN_JOY_X);
+              // --- ৩. কনফার্মেশন ডায়ালগ ---
+              else if (app_state == STATE_CONFIRM_EXIT) {
                   if (millis() - last_input > 200) {
-                      if (joy_x > 3000 && pause_selected > 0) { pause_selected--; draw_pause_menu(); last_input = millis(); }
-                      if (joy_x < 1000 && pause_selected < 4) { pause_selected++; draw_pause_menu(); last_input = millis(); }
+                      if (joy_y < 1000) { confirm_selected = 0; draw_confirm_dialog(); last_input = millis(); }
+                      if (joy_y > 3000) { confirm_selected = 1; draw_confirm_dialog(); last_input = millis(); }
                   }
 
-                  if (digitalRead(PIN_B1) == LOW && millis() - last_input > 250) {
+                  if (b1_down && millis() - last_input > 250) {
+                      last_input = millis();
+                      if (confirm_selected == 0) return_to_master_launcher();
+                      else { app_state = STATE_HOME_MENU; draw_home_menu(); }
+                  }
+                  if (b2_down && millis() - last_input > 250) {
+                      last_input = millis();
+                      app_state = STATE_HOME_MENU;
+                      draw_home_menu();
+                  }
+                  delay(20);
+              }
+              // --- ৪. ইন-গেম পজ মেনু (Speed 1x/2x/3x সহ) ---
+              else if (app_state == STATE_PAUSED) {
+                  if (millis() - last_input > 200) {
+                      if (joy_x > 3000 && pause_selected > 0) { pause_selected--; draw_pause_menu(); last_input = millis(); }
+                      if (joy_x < 1000 && pause_selected < 5) { pause_selected++; draw_pause_menu(); last_input = millis(); }
+
+                      // Speed অপশন (< > দিয়েও পরিবর্তন করা যাবে)
+                      if (pause_selected == 3) {
+                          if (joy_y > 3000) { game_speed = (game_speed % 3) + 1; draw_pause_menu(); last_input = millis(); }
+                          else if (joy_y < 1000) { game_speed = (game_speed == 1) ? 3 : game_speed - 1; draw_pause_menu(); last_input = millis(); }
+                      }
+                  }
+
+                  if (b1_down && millis() - last_input > 250) {
                       last_input = millis();
                       if (pause_selected == 0) { app_state = STATE_INGAME; while(display_busy) delay(1); tft.fillScreen(TFT_BLACK); }
                       else if (pause_selected == 1) { save_state(); app_state = STATE_INGAME; while(display_busy) delay(1); tft.fillScreen(TFT_BLACK); }
                       else if (pause_selected == 2) { load_state(); app_state = STATE_INGAME; while(display_busy) delay(1); tft.fillScreen(TFT_BLACK); }
-                      else if (pause_selected == 3) { active_palette = (active_palette + 1) % 4; draw_pause_menu(); }
-                      else if (pause_selected == 4) { save_battery_ram(); app_state = STATE_HOME; draw_home_ui(); }
+                      else if (pause_selected == 3) { game_speed = (game_speed % 3) + 1; draw_pause_menu(); }
+                      else if (pause_selected == 4) { active_palette = (active_palette + 1) % 4; draw_pause_menu(); }
+                      else if (pause_selected == 5) { if(ram_dirty) save_battery_ram(); app_state = STATE_HOME; draw_home_ui(); }
                   }
-                  if (digitalRead(PIN_B2) == LOW && millis() - last_input > 250) {
+                  if (b2_down && millis() - last_input > 250) {
                       last_input = millis();
                       app_state = STATE_INGAME;
                       while (display_busy) delay(1);
@@ -694,11 +890,15 @@ jobs:
                   }
                   delay(20);
               }
+              // --- ৫. আসল গেমপ্লে (1x / 2x / 3x + স্মার্ট .sav অটো-সেভ) ---
               else if (app_state == STATE_INGAME) {
                   uint32_t frame_start = micros();
 
-                  int joy_x = analogRead(PIN_JOY_X);
-                  int joy_y = analogRead(PIN_JOY_Y);
+                  // স্মার্ট অটো-সেভ: গেমের ভেতরে সেভ করার ২ সেকেন্ড পর অটো ফ্ল্যাশে জমা
+                  if (ram_dirty && (millis() - last_ram_write_ms > 2000)) {
+                      save_battery_ram();
+                      frame_start = micros();
+                  }
 
                   gb.direct.joypad = 0xFF;
                   gb.direct.joypad_bits.up    = (joy_x > 3000) ? 0 : 1;
@@ -706,17 +906,17 @@ jobs:
                   gb.direct.joypad_bits.right = (joy_y > 3000) ? 0 : 1;
                   gb.direct.joypad_bits.left  = (joy_y < 1000) ? 0 : 1;
 
-                  gb.direct.joypad_bits.a = digitalRead(PIN_B1);
-                  gb.direct.joypad_bits.b = digitalRead(PIN_B2);
+                  gb.direct.joypad_bits.a = b1_down ? 0 : 1;
+                  gb.direct.joypad_bits.b = b2_down ? 0 : 1;
 
-                  if (digitalRead(PIN_B1) == LOW && digitalRead(PIN_B2) == LOW) {
+                  if (b1_down && b2_down) {
                       gb.direct.joypad_bits.select = 0;
                   } else {
                       gb.direct.joypad_bits.select = 1;
                   }
 
                   static unsigned long b3_hold = 0;
-                  if (digitalRead(PIN_B3) == LOW) {
+                  if (b3_down) {
                       if (b3_hold == 0) b3_hold = millis();
                       if (millis() - b3_hold > 1200) {
                           app_state = STATE_PAUSED;
@@ -735,10 +935,13 @@ jobs:
                       b3_hold = 0;
                   }
 
-                  // Core 1-এ আসল ৬০ FPS এ গেম এক্সিকিউট (SPI ছাড়াই)
-                  gb_run_frame(&gb);
+                  // Fast Forward স্পিড অনুযায়ী ১, ২ বা ৩ ফ্রেম এক্সিকিউট (শুধু শেষ ফ্রেমটি ড্র হবে)
+                  for (int s = 0; s < game_speed; s++) {
+                      skip_lcd_render = (s < game_speed - 1);
+                      gb_run_frame(&gb);
+                  }
+                  skip_lcd_render = false;
 
-                  // ১:১ রিয়েল-টাইম (১৬,৭৪২ মাইক্রো-সেকেন্ড) এবং কুলিং স্লিপ
                   int32_t remaining = 16742 - (int32_t)(micros() - frame_start);
                   if (remaining > 1000) {
                       delay(remaining / 1000);
